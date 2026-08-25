@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BetBoard Pro</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-wrap">
+          <div class="brand-mark">B</div>
+          <div>
+            <p class="eyebrow">Sportsbook</p>
+            <h1>BetBoard Pro</h1>
+          </div>
+        </div>
+
+        <nav class="main-nav" aria-label="Main navigation">
+          <button class="nav-item active">Live</button>
+          <button class="nav-item">NFL</button>
+          <button class="nav-item">NBA</button>
+          <button class="nav-item">Soccer</button>
+          <button class="nav-item">MLB</button>
+        </nav>
+
+        <div class="account-panel">
+          <div class="chip dark">$1,840</div>
+          <button class="ghost-btn">Deposit</button>
+        </div>
+      </header>
+
+      <main class="dashboard">
+        <section class="primary-panel">
+          <div class="hero-row">
+            <div class="headline-block">
+              <p class="eyebrow success">Trending now</p>
+              <h2>Best value picks for tonight</h2>
+            </div>
+            <div class="summary-strip">
+              <div class="summary-card">
+                <span>Win rate</span>
+                <strong>62.4%</strong>
+              </div>
+              <div class="summary-card">
+                <span>Open bets</span>
+                <strong>16</strong>
+              </div>
+              <div class="summary-card">
+                <span>Profit</span>
+                <strong>+$240</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="filters-row">
+            <button class="filter active">All markets</button>
+            <button class="filter">Moneyline</button>
+            <button class="filter">Totals</button>
+            <button class="filter">Player props</button>
+            <button class="filter">Parlays</button>
+          </div>
+
+          <div id="marketsGrid" class="markets-grid" aria-live="polite"></div>
+        </section>
+
+        <aside class="bet-slip-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Bet slip</p>
+              <h3>Selections</h3>
+            </div>
+            <span id="selectionCount" class="count-pill">0</span>
+          </div>
+
+          <div id="betSlip" class="bet-slip"></div>
+
+          <div class="stake-box">
+            <label for="stakeInput">Stake</label>
+            <div class="stake-row">
+              <span>$</span>
+              <input id="stakeInput" type="number" min="5" step="5" value="25" />
+            </div>
+          </div>
+
+          <div class="bet-summary">
+            <div>
+              <span>Potential win</span>
+              <strong id="potentialWin">$0.00</strong>
+            </div>
+            <div>
+              <span>Bankroll</span>
+              <strong id="bankrollValue">$1,840</strong>
+            </div>
+          </div>
+
+          <button id="placeBetBtn" class="place-bet-btn">Place bet</button>
+        </aside>
+      </main>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
