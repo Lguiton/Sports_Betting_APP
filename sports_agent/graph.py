@@ -10,7 +10,8 @@ from sports_agent.nodes import (
     quant_code_node,
     sports_tutor_node,
     data_science_node,
-    data_analyst_node
+    data_analyst_node,
+    all_models_node
 )
 
 def route_by_intent(state: SportsAgentState) -> str:
@@ -23,7 +24,7 @@ def route_by_intent(state: SportsAgentState) -> str:
     if matchup_query and intent == "tutor":
         return "odds_ev"
 
-    if intent in ["odds_ev", "bankroll", "quant_code", "tutor", "data_science", "data_analyst"]:
+    if intent in ["odds_ev", "bankroll", "quant_code", "tutor", "data_science", "data_analyst", "all_models"]:
         return intent
     return "tutor"
 
@@ -38,6 +39,7 @@ workflow.add_node("quant_code", quant_code_node)
 workflow.add_node("tutor", sports_tutor_node)
 workflow.add_node("data_science", data_science_node)
 workflow.add_node("data_analyst", data_analyst_node)
+workflow.add_node("all_models", all_models_node)
 
 # Entry Point
 workflow.set_entry_point("classifier")
@@ -52,7 +54,8 @@ workflow.add_conditional_edges(
         "quant_code": "quant_code",
         "tutor": "tutor",
         "data_science": "data_science",
-        "data_analyst": "data_analyst"
+        "data_analyst": "data_analyst",
+        "all_models": "all_models"
     }
 )
 
@@ -63,6 +66,7 @@ workflow.add_edge("quant_code", END)
 workflow.add_edge("tutor", END)
 workflow.add_edge("data_science", END)
 workflow.add_edge("data_analyst", END)
+workflow.add_edge("all_models", END)
 
 # Memory Checkpointer & Compilation
 memory = MemorySaver()

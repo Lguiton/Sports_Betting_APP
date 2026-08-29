@@ -31,15 +31,23 @@ llm_with_tools = llm.bind_tools([
 ])
 
 def american_to_decimal(american_odds: float) -> float:
+    if american_odds == 0:
+        raise ValueError("American odds cannot be zero")
     if american_odds > 0:
         return round((american_odds / 100) + 1, 4)
     else:
         return round((100 / abs(american_odds)) + 1, 4)
 
 def decimal_to_implied_prob(decimal_odds: float) -> float:
+    if decimal_odds <= 1:
+        raise ValueError("Decimal odds must be greater than 1")
     return round((1 / decimal_odds) * 100, 2)
 
 def calculate_ev(win_prob: float, american_odds: float, stake: float = 100.0) -> dict:
+    if not 0 <= win_prob <= 1:
+        raise ValueError("Win probability must be between 0 and 1")
+    if stake <= 0:
+        raise ValueError("Stake must be greater than zero")
     dec_odds = american_to_decimal(american_odds)
     profit = stake * (dec_odds - 1)
     ev = (win_prob * profit) - ((1 - win_prob) * stake)
@@ -52,11 +60,67 @@ def calculate_ev(win_prob: float, american_odds: float, stake: float = 100.0) ->
         "ev_percentage": round(ev_pct, 2)
     }
 
+def kelly_criterion(win_prob: float, american_odds: float, fraction: float = 0.5) -> dict:
+    if not 0 <= win_prob <= 1:
+        raise ValueError("Win probability must be between 0 and 1")
+    if not 0 < fraction <= 1:
+        raise ValueError("Kelly fraction must be greater than zero and at most 1")
+    decimal_odds = american_to_decimal(american_odds)
+    edge = (decimal_odds - 1) * win_prob - (1 - win_prob)
+    full_kelly = edge / (decimal_odds - 1)
+    return {
+        "full_kelly_pct": round(full_kelly * 100, 2),
+        "fractional_kelly_pct": round(max(0, full_kelly * fraction) * 100, 2),
+        "fraction_used": "1/2",
+    }
+
+def tool_payload(tool_result):
+    content = getattr(tool_result, "content", tool_result)
+    if isinstance(content, str):
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return {"result": content}
+    return content
+
+async def all_models_node(state: SportsAgentState) -> dict:
+    raw_query = state["messages"][-1].content
+    query = raw_query.split("User Prompt:", 1)[-1].split("[System Context", 1)[0].strip()
+    matchup = re.search(r"([A-Za-z][A-Za-z .'-]+?)\s+(?:vs\.?|versus)\s+([A-Za-z][A-Za-z .'-]+)", query, re.IGNORECASE)
+    home_team = matchup.group(1).strip().title() if matchup else "Home Team"
+    away_team = matchup.group(2).strip().split(".")[0].strip().title() if matchup else "Away Team"
+    risk_match = re.search(r"Risk Profile:\s*(Conservative|Moderate|Aggressive)", query, re.IGNORECASE)
+    risk_profile = risk_match.group(1).title() if risk_match else "Moderate"
+    line_match = re.search(r"(?:line|total)\s*(?:is|=)?\s*(\d+(?:\.\d+)?)", query, re.IGNORECASE)
+    vegas_line = float(line_match.group(1)) if line_match else 47.5
+
+    odds = tool_payload(await fetch_mock_live_odds.ainvoke({"team": f"{home_team} vs {away_team}", "risk_profile": risk_profile}))
+    prediction = tool_payload(await predict_matchup_winner.ainvoke({"home_team": home_team, "away_team": away_team, "sport": "NFL"}))
+    monte_carlo = tool_payload(await run_monte_carlo_simulation.ainvoke({"home_team": home_team, "away_team": away_team, "iterations": 10000}))
+    poisson = tool_payload(await calculate_poisson_over_under.ainvoke({
+        "home_off_epa": 0.15, "away_def_epa": -0.05, "away_off_epa": 0.22,
+        "home_def_epa": 0.08, "vegas_line": vegas_line,
+    }))
+    win_probability = float(str(prediction.get("win_probability", "50%")).rstrip("%")) / 100
+    market_odds = float(odds.get("american_odds", -110))
+    kelly = kelly_criterion(win_probability, market_odds, fraction=0.5)
+    result = {"odds": odds, "prediction": prediction, "kelly": kelly, "monte_carlo": monte_carlo, "poisson": poisson}
+    return {"messages": [AIMessage(content=f"```json\n{json.dumps(result, default=str, indent=2)}\n```")]}
+
 async def classify_sports_intent_node(state: SportsAgentState) -> dict:
-    last_msg = state["messages"][-1].content.lower()
+    raw_content = state["messages"][-1].content
+    # app.py injects a "[System Context - Active Bankroll: $X, Risk Profile: Y]"
+    # prefix ahead of every user message. That prefix literally contains the
+    # substring "bankroll", which was tricking this keyword classifier into
+    # routing almost any query into the bankroll node. Classify on the user's
+    # actual question only.
+    user_text = raw_content.split("User Prompt:", 1)[-1] if "User Prompt:" in raw_content else raw_content
+    last_msg = user_text.lower()
     
     # Enhanced deterministic keyword matching for robust routing
-    if any(k in last_msg for k in ["monte carlo", "simulation", "regression", "statsmodels", "poisson", "over/under", "epa"]):
+    if any(k in last_msg for k in ["all models", "all four", "all predictors", "complete analysis"]):
+        intent = "all_models"
+    elif any(k in last_msg for k in ["monte carlo", "simulation", "regression", "statsmodels", "poisson", "over/under", "epa"]):
         intent = "data_science"
     elif any(k in last_msg for k in ["clv", "efficiency", "dvoa", "havoc"]):
         intent = "data_analyst"
@@ -75,7 +139,7 @@ async def classify_sports_intent_node(state: SportsAgentState) -> dict:
         """
         response = await llm.ainvoke([SystemMessage(content=prompt)])
         res = response.content.strip().lower()
-        intent = res if res in ["data_science", "data_analyst", "odds_ev", "bankroll", "quant_code"] else "odds_ev"
+        intent = res if res in ["data_science", "data_analyst", "odds_ev", "bankroll", "quant_code", "tutor"] else "odds_ev"
         
     return {"intent": intent}
 
@@ -111,7 +175,7 @@ async def data_science_node(state: SportsAgentState) -> dict:
                 tool_result = await calculate_poisson_over_under.ainvoke(tool_call)
             else:
                 continue
-            tool_results.append(tool_result)
+            tool_results.append(tool_payload(tool_result))
         serialized_results = "\n\n".join(
             f"```json\n{json.dumps(result, default=str, indent=2)}\n```"
             for result in tool_results
@@ -128,9 +192,9 @@ async def odds_ev_node(state: SportsAgentState) -> dict:
         for tool_call in res.tool_calls:
             name = tool_call["name"]
             if name == "fetch_mock_live_odds":
-                tool_results.append(await fetch_mock_live_odds.ainvoke(tool_call))
+                tool_results.append(tool_payload(await fetch_mock_live_odds.ainvoke(tool_call)))
             elif name == "predict_matchup_winner":
-                tool_results.append(await predict_matchup_winner.ainvoke(tool_call))
+                tool_results.append(tool_payload(await predict_matchup_winner.ainvoke(tool_call)))
         combined_result = {}
         for tool_result in tool_results:
             combined_result.update(tool_result)

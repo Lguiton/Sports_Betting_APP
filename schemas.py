@@ -1,5 +1,5 @@
 # schemas.py
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 class SportsBettingReviewOutput(BaseModel):
     odds_analysis: str = Field(
@@ -16,8 +16,25 @@ class SportsBettingReviewOutput(BaseModel):
     )
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1, max_length=4000)
     thread_id: str = "sports_default_session"
+    bankroll: float = Field(default=1000.0, gt=0, le=10_000_000)
+    risk_profile: str = "Moderate"
+
+    @field_validator("message")
+    @classmethod
+    def message_must_contain_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("message must contain text")
+        return value.strip()
+
+    @field_validator("risk_profile")
+    @classmethod
+    def risk_profile_must_be_supported(cls, value: str) -> str:
+        normalized = value.title()
+        if normalized not in {"Conservative", "Moderate", "Aggressive"}:
+            raise ValueError("risk_profile must be Conservative, Moderate, or Aggressive")
+        return normalized
 
 class ChatResponse(BaseModel):
     response: str

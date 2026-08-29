@@ -1,4 +1,9 @@
 .env
+*.duckdb
+*.duckdb.wal
 __pycache__/
+node_modules/
+venv/
+.next/
 *.pyc
 .vscode/

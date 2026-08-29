@@ -14,6 +14,7 @@ def fetch_mock_live_odds(team: str, risk_profile: str) -> dict:
         base_units = 3.5
 
     return {
+        "american_odds": -110,
         "units": round(base_units + random.uniform(-0.5, 0.5), 2),
         "coverage": random.randint(75, 95),
         "edges": random.randint(450, 600),
