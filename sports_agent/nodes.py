@@ -4,7 +4,7 @@ from langchain_core.messages import AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from sports_agent.state import SportsAgentState
 from sports_agent.tools import (
-    fetch_mock_live_odds, 
+    fetch_live_odds, 
     predict_matchup_winner, 
     run_monte_carlo_simulation, 
     calculate_clv,
@@ -22,7 +22,7 @@ llm = ChatOpenAI(
 
 # Bind all tools to the LLM
 llm_with_tools = llm.bind_tools([
-    fetch_mock_live_odds, predict_matchup_winner, run_monte_carlo_simulation, 
+    fetch_live_odds, predict_matchup_winner, run_monte_carlo_simulation, 
     calculate_clv, statsmodels_spread_regression, calculate_poisson_over_under
 ])
 
@@ -66,10 +66,10 @@ def tool_payload(tool_result):
     return content
 
 
-# THE FIX: Bulletproof Synthesis Layer
+# Bulletproof Synthesis Layer
 async def synthesize_final_response(state: SportsAgentState, tool_data: dict) -> dict:
     synthesis_prompt = SystemMessage(content=(
-        f"--- RAW SIMULATION DATA ---\n{json.dumps(tool_data, default=str)}\n\n"
+        f"--- RAW SIMULATION & LIVE ODDS DATA ---\n{json.dumps(tool_data, default=str)}\n\n"
         f"CRITICAL FORMATTING RULES:\n"
         f"1. You MUST write a 2-3 sentence conversational game summary FIRST.\n"
         f"2. You MUST output the ```json block LAST.\n"
@@ -81,13 +81,14 @@ async def synthesize_final_response(state: SportsAgentState, tool_data: dict) ->
     return {"messages": [final_res]}
 
 
-# THE FIX: Instruct the AI to dynamically generate required tool arguments
+# THE FIX: Instruct the AI to dynamically pass the sport to ALL tools
 async def all_models_node(state: SportsAgentState) -> dict:
     sys_prompt = (
-        "You are a Lead Quant. Call your odds, prediction, monte carlo, and poisson tools to analyze this matchup. "
-        "CRITICAL: The `calculate_poisson_over_under` tool requires EPA metrics. You MUST dynamically estimate realistic NFL "
-        "EPA values (between -0.2 and 0.3) for both teams based on their current strength, and estimate "
-        "a valid `vegas_line` (e.g. 45.5) so the tool can run successfully."
+        "You are a Lead Quant. Call your live odds, prediction, monte carlo, and poisson tools to analyze this matchup. "
+        "CRITICAL RULES:\n"
+        "1. IDENTIFY THE SPORT: Determine if the user is asking for MLB, NBA, or NFL.\n"
+        "2. PASS THE SPORT: You MUST pass the identified sport (e.g., 'MLB', 'NBA', 'NFL') to the `sport` parameter for EVERY tool.\n"
+        "3. REALISTIC DATA: Estimate realistic EPA values for the specific sport, and a valid `vegas_line` (e.g., 8.5 for MLB, 225.5 for NBA, 45.5 for NFL) so the tools run successfully."
     )
     res = await llm_with_tools.ainvoke([SystemMessage(content=sys_prompt), state["messages"][-1]])
     
@@ -96,13 +97,14 @@ async def all_models_node(state: SportsAgentState) -> dict:
         for tool_call in res.tool_calls:
             name = tool_call["name"]
             try:
-                if name == "fetch_mock_live_odds": combined_data["odds"] = tool_payload(await fetch_mock_live_odds.ainvoke(tool_call))
+                if name == "fetch_live_odds": combined_data["odds"] = tool_payload(await fetch_live_odds.ainvoke(tool_call))
                 elif name == "predict_matchup_winner": combined_data["prediction"] = tool_payload(await predict_matchup_winner.ainvoke(tool_call))
                 elif name == "run_monte_carlo_simulation": combined_data["monte_carlo"] = tool_payload(await run_monte_carlo_simulation.ainvoke(tool_call))
                 elif name == "calculate_poisson_over_under": combined_data["poisson"] = tool_payload(await calculate_poisson_over_under.ainvoke(tool_call))
             except Exception as e:
-                # Catch tool errors silently so the AI can fall back to estimating data
                 combined_data[name + "_error"] = str(e)
+
+            print(f"\n--- TOOL DEBUG DATA ---\n{json.dumps(combined_data, indent=2)}\n")
             
     return await synthesize_final_response(state, combined_data)
 
@@ -134,7 +136,11 @@ async def data_analyst_node(state: SportsAgentState) -> dict:
 
 
 async def data_science_node(state: SportsAgentState) -> dict:
-    sys_prompt = "You are a Lead Quantitative Data Scientist running simulations. Estimate realistic EPA metrics if tools require them."
+    sys_prompt = (
+        "You are a Lead Quantitative Data Scientist running simulations. "
+        "IDENTIFY THE SPORT (MLB, NBA, NFL) and pass it to EVERY tool's `sport` parameter. "
+        "Estimate realistic EPA metrics and vegas_line based on the sport."
+    )
     res = await llm_with_tools.ainvoke([SystemMessage(content=sys_prompt), state["messages"][-1]])
     data = {}
     if res.tool_calls:
@@ -147,13 +153,16 @@ async def data_science_node(state: SportsAgentState) -> dict:
 
 
 async def odds_ev_node(state: SportsAgentState) -> dict:
-    sys_prompt = "You are a Senior Quantitative Sports Handicapper."
+    sys_prompt = (
+        "You are a Senior Quantitative Sports Handicapper. "
+        "IDENTIFY THE SPORT (MLB, NBA, NFL) and pass it to EVERY tool's `sport` parameter."
+    )
     res = await llm_with_tools.ainvoke([SystemMessage(content=sys_prompt), state["messages"][-1]])
     data = {}
     if res.tool_calls:
         for tc in res.tool_calls:
             name = tc["name"]
-            if name == "fetch_mock_live_odds": data["odds"] = tool_payload(await fetch_mock_live_odds.ainvoke(tc))
+            if name == "fetch_live_odds": data["odds"] = tool_payload(await fetch_live_odds.ainvoke(tc))
             elif name == "predict_matchup_winner": data["prediction"] = tool_payload(await predict_matchup_winner.ainvoke(tc))
     return await synthesize_final_response(state, data)
 

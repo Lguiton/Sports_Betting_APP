@@ -1,36 +1,72 @@
-
-from langchain_core.tools import tool
+import requests
 import random
+from langchain_core.tools import tool
+from config import ODDS_API_KEY
 
 @tool
-def fetch_mock_live_odds(team: str, risk_profile: str) -> dict:
-    """Fetches live odds, spreads, and calculates recommended Kelly units for a given matchup."""
-    
-    if risk_profile == "Conservative":
-        base_units = 1.5
-    elif risk_profile == "Aggressive":
-        base_units = 6.2
-    else:
-        base_units = 3.5
-
-    return {
-        "american_odds": -110,
-        "units": round(base_units + random.uniform(-0.5, 0.5), 2),
-        "coverage": random.randint(75, 95),
-        "edges": random.randint(450, 600),
-        "delta": round(random.uniform(0.9, 1.2), 2),
-        "market_context": f"Live lines confirm sharp movement for {team}."
+def fetch_live_odds(home_team: str, away_team: str, sport_key: str = "americanfootball_nfl") -> dict:
+    """
+    Fetches real-time Vegas odds (moneyline, spread, totals) from live sportsbooks for a specific matchup.
+    Args:
+        home_team: The name of the home team (e.g., 'Chiefs').
+        away_team: The name of the away team (e.g., 'Ravens').
+        sport_key: The Odds API sport key (e.g., 'americanfootball_nfl', 'baseball_mlb', 'basketball_nba').
+    """
+    if not ODDS_API_KEY:
+        return {"error": "API Key Error: ODDS_API_KEY is missing from environment variables."}
+        
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "us",
+        "markets": "h2h,spreads,totals",
+        "oddsFormat": "american",
+        "bookmakers": "draftkings"
     }
+    
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        games = response.json()
+        
+        for game in games:
+            live_home = game.get("home_team", "").lower()
+            live_away = game.get("away_team", "").lower()
+            
+            if home_team.lower() in live_home or live_away in home_team.lower() or away_team.lower() in live_away or live_away in away_team.lower():
+                if not game.get("bookmakers"):
+                    continue
+                
+                book = game["bookmakers"][0]
+                return {
+                    "matchup": f"{game['away_team']} @ {game['home_team']}",
+                    "start_time": game["commence_time"],
+                    "bookmaker": book["title"],
+                    "live_markets": book.get("markets", [])
+                }
+                
+        return {"error": f"Matchup not found on active slate: {away_team} at {home_team}."}
+        
+    except Exception as e:
+        return {"error": f"Live Odds API request failed: {str(e)}"}
 
 @tool
 def predict_matchup_winner(home_team: str, away_team: str, sport: str = "NFL") -> dict:
-    """Predicts game outcome, win probabilities, projected scores, and market edges directly."""
-    
+    """Predicts game outcome, win probabilities, and projected scores tailored to the specific sport."""
     home_prob = round(random.uniform(0.42, 0.72), 2)
     away_prob = round(1.0 - home_prob, 2)
     
-    home_score = round(random.uniform(21.0, 31.0), 1)
-    away_score = round(random.uniform(17.0, 27.0), 1)
+    # Dynamic Scoring Baselines
+    sport_upper = sport.upper()
+    if "MLB" in sport_upper or "BASEBALL" in sport_upper:
+        home_score = round(random.uniform(3.0, 6.5), 1)
+        away_score = round(random.uniform(2.5, 5.5), 1)
+    elif "NBA" in sport_upper or "BASKETBALL" in sport_upper:
+        home_score = round(random.uniform(105.0, 118.0), 1)
+        away_score = round(random.uniform(102.0, 115.0), 1)
+    else: # Default to NFL
+        home_score = round(random.uniform(21.0, 31.0), 1)
+        away_score = round(random.uniform(17.0, 27.0), 1)
     
     favored = home_team if home_prob > away_prob else away_team
     confidence = int(max(home_prob, away_prob) * 100)
@@ -44,16 +80,25 @@ def predict_matchup_winner(home_team: str, away_team: str, sport: str = "NFL") -
     }
 
 @tool
-def run_monte_carlo_simulation(home_team: str, away_team: str, iterations: int = 10000) -> dict:
-    """Simulates a matchup 10,000 times using statistical variance to project true win probabilities and median scores."""
+def run_monte_carlo_simulation(home_team: str, away_team: str, sport: str = "NFL", iterations: int = 10000) -> dict:
+    """Simulates a matchup 10,000 times using sport-specific statistical variance to project win probabilities."""
     home_wins = 0
     away_wins = 0
     home_scores = []
     away_scores = []
     
+    # Dynamic Variance Settings (Mean, Standard Deviation)
+    sport_upper = sport.upper()
+    if "MLB" in sport_upper or "BASEBALL" in sport_upper:
+        mu_h, sig_h, mu_a, sig_a = 4.8, 2.5, 4.2, 2.2
+    elif "NBA" in sport_upper or "BASKETBALL" in sport_upper:
+        mu_h, sig_h, mu_a, sig_a = 112.5, 12.0, 108.5, 11.5
+    else: # Default NFL
+        mu_h, sig_h, mu_a, sig_a = 24.5, 6.2, 21.5, 5.8
+    
     for _ in range(iterations):
-        h_score = max(0, int(random.normalvariate(24.5, 6.2)))
-        a_score = max(0, int(random.normalvariate(21.5, 5.8)))
+        h_score = max(0, int(random.normalvariate(mu_h, sig_h)))
+        a_score = max(0, int(random.normalvariate(mu_a, sig_a)))
         
         home_scores.append(h_score)
         away_scores.append(a_score)
@@ -92,7 +137,7 @@ def calculate_clv(wager_odds: float, closing_odds: float) -> dict:
 
 @tool
 def statsmodels_spread_regression(net_epa: float, net_success: float, pass_rush_diff: float) -> dict:
-    """Runs a statsmodels OLS regression on efficiency metrics, controlling for turnover regression and returning confidence intervals."""
+    """Runs a statsmodels OLS regression on efficiency metrics."""
     import pandas as pd
     import statsmodels.formula.api as smf
 
@@ -127,19 +172,33 @@ def statsmodels_spread_regression(net_epa: float, net_success: float, pass_rush_
 @tool
 def calculate_poisson_over_under(home_off_epa: float, away_def_epa: float, 
                                  away_off_epa: float, home_def_epa: float, 
-                                 vegas_line: float, home_field_adv: float = 2.5) -> dict:
+                                 vegas_line: float, sport: str = "NFL", home_field_adv: float = 2.5) -> dict:
     """
-    Fits a Poisson GLM regression on efficiency metrics, estimates expected lambdas,
-    and computes exact Over/Under probabilities via a joint probability matrix.
+    Fits a Poisson GLM regression on efficiency metrics and adapts baseline training data based on the sport.
     """
     import pandas as pd
     import numpy as np
     import statsmodels.formula.api as smf
     from scipy.stats import poisson
 
+    # Dynamic Training Data Baselines
+    sport_upper = sport.upper()
+    if "MLB" in sport_upper or "BASEBALL" in sport_upper:
+        base_home = [4, 5, 3, 6, 2, 7, 4, 3, 5, 8]
+        base_away = [3, 2, 4, 3, 5, 2, 6, 4, 3, 2]
+        max_points = 25
+    elif "NBA" in sport_upper or "BASKETBALL" in sport_upper:
+        base_home = [110, 105, 120, 115, 108, 112, 100, 125, 118, 104]
+        base_away = [105, 110, 100, 112, 115, 108, 120, 102, 111, 106]
+        max_points = 280
+    else: # NFL
+        base_home = [24, 17, 31, 14, 27, 20, 35, 10, 28, 21]
+        base_away = [17, 24, 13, 21, 17, 28, 14, 27, 20, 24]
+        max_points = 65
+
     training_data = pd.DataFrame({
-        "home_points": [24, 17, 31, 14, 27, 20, 35, 10, 28, 21],
-        "away_points": [17, 24, 13, 21, 17, 28, 14, 27, 20, 24],
+        "home_points": base_home,
+        "away_points": base_away,
         "home_off_epa": [0.10, -0.05, 0.20, -0.10, 0.15, 0.02, 0.25, -0.15, 0.18, 0.05],
         "away_def_epa": [-0.02, 0.08, -0.12, 0.05, -0.04, 0.03, -0.15, 0.10, -0.08, 0.01],
         "away_off_epa": [0.05, 0.12, -0.08, 0.15, -0.02, 0.10, -0.05, 0.18, 0.02, 0.08],
@@ -147,8 +206,6 @@ def calculate_poisson_over_under(home_off_epa: float, away_def_epa: float,
         "home_field_adv": [1.0] * 10
     })
 
-    # The training sample has a constant home-field value, so including it
-    # alongside the intercept creates a singular design matrix.
     home_model = smf.poisson("home_points ~ home_off_epa + away_def_epa", data=training_data).fit(disp=0)
     away_model = smf.poisson("away_points ~ away_off_epa + home_def_epa", data=training_data).fit(disp=0)
 
@@ -163,7 +220,6 @@ def calculate_poisson_over_under(home_off_epa: float, away_def_epa: float,
     pred_home_lambda = float(home_model.predict(upcoming).iloc[0])
     pred_away_lambda = float(away_model.predict(upcoming).iloc[0])
 
-    max_points = 60
     matrix = np.outer(
         poisson.pmf(np.arange(max_points), pred_home_lambda),
         poisson.pmf(np.arange(max_points), pred_away_lambda)
