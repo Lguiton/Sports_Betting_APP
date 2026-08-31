@@ -1,4 +1,4 @@
-@echo off
+ec@echo off
 cd /d "%~dp0"
 echo === NexFlow backend launcher ===
 
@@ -27,6 +27,6 @@ if errorlevel 1 (
 
 echo.
 echo Starting backend on http://localhost:8000 ...
-".venv\Scripts\python.exe" app.py
+".venv\Scripts\python.exe" -m uvicorn backend.main:app --reload --port 8000
 
 pause

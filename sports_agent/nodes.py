@@ -36,7 +36,10 @@ def american_to_decimal(american_odds: float) -> float:
     if american_odds > 0:
         return round((american_odds / 100) + 1, 4)
     else:
-        return round((100 / abs(american_odds)) + 1, 4)
+        abs_odds = abs(american_odds)
+        if abs_odds == 0:
+            raise ValueError("American odds cannot be zero")
+        return round((100 / abs_odds) + 1, 4)
 
 def decimal_to_implied_prob(decimal_odds: float) -> float:
     if decimal_odds <= 1:
@@ -103,6 +106,12 @@ async def all_models_node(state: SportsAgentState) -> dict:
     }))
     win_probability = float(str(prediction.get("win_probability", "50%")).rstrip("%")) / 100
     market_odds = float(odds.get("american_odds", -110))
+    # Use actual odds from odds tool if present
+    if market_odds == -110 and "american_odds" in prediction:
+        try:
+            market_odds = float(prediction["american_odds"])
+        except Exception:
+            pass
     kelly = kelly_criterion(win_probability, market_odds, fraction=0.5)
     result = {"odds": odds, "prediction": prediction, "kelly": kelly, "monte_carlo": monte_carlo, "poisson": poisson}
     return {"messages": [AIMessage(content=f"```json\n{json.dumps(result, default=str, indent=2)}\n```")]}
