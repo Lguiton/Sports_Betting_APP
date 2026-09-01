@@ -1,5 +1,6 @@
 import requests
 import random
+import duckdb
 from langchain_core.tools import tool
 from config import ODDS_API_KEY
 
@@ -245,3 +246,21 @@ def calculate_poisson_over_under(home_off_epa: float, away_def_epa: float,
         "under_probability_pct": round(under_prob * 100, 2),
         "edge_recommendation": "OVER VALUE" if over_prob > 0.524 else ("UNDER VALUE" if under_prob > 0.524 else "NO CLEAR EDGE")
     }
+
+@tool
+def log_wager_to_duckdb(sport: str, matchup: str, recommended_wager: float, kelly_percentage: float, predicted_winner: str, vegas_line: float) -> dict:
+    """
+    Logs the agent's final prediction and Kelly wager sizing to the local DuckDB telemetry database.
+    This MUST be called after all other models have run and a final wager is calculated.
+    """
+    try:
+        # Pointing to the new directory we just made with mkdir
+        conn = duckdb.connect('data/telemetry.duckdb')
+        conn.execute('''
+            INSERT INTO predictions_log (sport, matchup, recommended_wager, kelly_percentage, predicted_winner, vegas_line)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (sport, matchup, recommended_wager, kelly_percentage, predicted_winner, vegas_line))
+        conn.close()
+        return {"status": "success", "message": f"Successfully logged {matchup} prediction to DuckDB."}
+    except Exception as e:
+        return {"error": f"Database logging failed: {str(e)}"}

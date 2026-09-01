@@ -1,5 +1,6 @@
 import json
 import re
+import duckdb
 from langchain_core.messages import AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from sports_agent.state import SportsAgentState
@@ -67,17 +68,47 @@ def tool_payload(tool_result):
 
 
 # Bulletproof Synthesis Layer
+# Bulletproof Synthesis Layer
 async def synthesize_final_response(state: SportsAgentState, tool_data: dict) -> dict:
     synthesis_prompt = SystemMessage(content=(
         f"--- RAW SIMULATION & LIVE ODDS DATA ---\n{json.dumps(tool_data, default=str)}\n\n"
         f"CRITICAL FORMATTING RULES:\n"
         f"1. You MUST write a 2-3 sentence conversational game summary FIRST.\n"
         f"2. You MUST output the ```json block LAST.\n"
-        f"3. NO SYMBOLS: Strip all '%' and '$' from your JSON numbers (e.g., use 63.9, not '63.9%').\n"
-        f"4. FILL THE GAPS: If any tool data is missing, use your expert sports knowledge to estimate realistic values so NO keys are left at 0 unless mathematically necessary.\n"
+        f"3. NO SYMBOLS: Strip all '%' and '$' from your JSON numbers.\n"
+        f"4. FILL THE GAPS: If any tool data is missing, estimate realistic values.\n"
         f"Format it exactly like the user's EXAMPLE PERFECT RESPONSE."
     ))
     final_res = await llm.ainvoke([synthesis_prompt, state["messages"][-1]])
+    
+    # --- SNEAKY BACKEND TELEMETRY LOGGING ---
+    try:
+        json_match = re.search(r'```json\n(.*?)\n```', final_res.content, re.DOTALL)
+        if json_match:
+            ui_data = json.loads(json_match.group(1))
+            
+            # THE FIX: Pull the matchup directly from the raw Python tool data!
+            matchup = tool_data.get("prediction", {}).get("prediction_target", 
+                      tool_data.get("monte_carlo", {}).get("matchup", "Unknown Matchup"))
+            
+            # Extract metrics from the UI JSON
+            recommended_wager = ui_data.get("kelly_sizing", {}).get("recommended_wager", 0)
+            kelly_pct = ui_data.get("kelly_sizing", {}).get("bankroll_percentage", 0)
+            winner = "Home" if ui_data.get("poisson_matchup", {}).get("home_win_prob", 50) > 50 else "Away"
+            vegas_line = ui_data.get("poisson_matchup", {}).get("total_points", 0)
+
+            # Silently log to DuckDB
+            conn = duckdb.connect('data/telemetry.duckdb')
+            conn.execute('''
+                INSERT INTO predictions_log (sport, matchup, recommended_wager, kelly_percentage, predicted_winner, vegas_line)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', ("Auto-Logged", matchup, recommended_wager, kelly_pct, winner, vegas_line))
+            conn.close()
+            print(f"\n[TELEMETRY SUCCESS] Automatically logged {matchup} to DuckDB!")
+    except Exception as e:
+        print(f"\n[TELEMETRY WARNING] Failed to parse and log data: {str(e)}")
+    # ----------------------------------------
+        
     return {"messages": [final_res]}
 
 
@@ -87,8 +118,8 @@ async def all_models_node(state: SportsAgentState) -> dict:
         "You are a Lead Quant. Call your live odds, prediction, monte carlo, and poisson tools to analyze this matchup. "
         "CRITICAL RULES:\n"
         "1. IDENTIFY THE SPORT: Determine if the user is asking for MLB, NBA, or NFL.\n"
-        "2. PASS THE SPORT: You MUST pass the identified sport (e.g., 'MLB', 'NBA', 'NFL') to the `sport` parameter for EVERY tool.\n"
-        "3. REALISTIC DATA: Estimate realistic EPA values for the specific sport, and a valid `vegas_line` (e.g., 8.5 for MLB, 225.5 for NBA, 45.5 for NFL) so the tools run successfully."
+        "2. PASS THE SPORT: You MUST pass the identified sport (e.g., 'MLB') to the `sport` parameter for EVERY tool.\n"
+        "3. REALISTIC DATA: Regardless of the sport, EPA parameters MUST be tiny decimals between -0.15 and 0.25 (e.g., 0.05). NEVER use whole numbers for EPA. Estimate a valid `vegas_line` (e.g., 8.5 for MLB, 225.5 for NBA, 45.5 for NFL)."
     )
     res = await llm_with_tools.ainvoke([SystemMessage(content=sys_prompt), state["messages"][-1]])
     
@@ -103,8 +134,9 @@ async def all_models_node(state: SportsAgentState) -> dict:
                 elif name == "calculate_poisson_over_under": combined_data["poisson"] = tool_payload(await calculate_poisson_over_under.ainvoke(tool_call))
             except Exception as e:
                 combined_data[name + "_error"] = str(e)
-
-            print(f"\n--- TOOL DEBUG DATA ---\n{json.dumps(combined_data, indent=2)}\n")
+                
+    # Keep the debug print so you can verify the math tools ran cleanly
+    print(f"\n--- TOOL DEBUG DATA ---\n{json.dumps(combined_data, indent=2)}\n")
             
     return await synthesize_final_response(state, combined_data)
 
@@ -149,6 +181,9 @@ async def data_science_node(state: SportsAgentState) -> dict:
             if name == "run_monte_carlo_simulation": data["monte_carlo"] = tool_payload(await run_monte_carlo_simulation.ainvoke(tc))
             elif name == "statsmodels_spread_regression": data["regression"] = tool_payload(await statsmodels_spread_regression.ainvoke(tc))
             elif name == "calculate_poisson_over_under": data["poisson"] = tool_payload(await calculate_poisson_over_under.ainvoke(tc))
+            
+    # ADDED TELEMETRY
+    print(f"\n--- TOOL DEBUG DATA (Data Science Node) ---\n{json.dumps(data, indent=2)}\n")
     return await synthesize_final_response(state, data)
 
 
@@ -164,6 +199,9 @@ async def odds_ev_node(state: SportsAgentState) -> dict:
             name = tc["name"]
             if name == "fetch_live_odds": data["odds"] = tool_payload(await fetch_live_odds.ainvoke(tc))
             elif name == "predict_matchup_winner": data["prediction"] = tool_payload(await predict_matchup_winner.ainvoke(tc))
+            
+    # ADDED TELEMETRY
+    print(f"\n--- TOOL DEBUG DATA (Odds Node) ---\n{json.dumps(data, indent=2)}\n")
     return await synthesize_final_response(state, data)
 
 
