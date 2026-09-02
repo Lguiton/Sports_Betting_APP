@@ -194,6 +194,58 @@ def get_scoreboard(sport: str, date: str | None = None) -> dict:
     return {"sport": normalize_sport(sport), "date": date, "games": games}
 
 
+def resolve_matchup_home_away(sport: str, team_a: str, team_b: str, date: str | None = None) -> dict:
+    """Figures out which of team_a/team_b is actually the home team, from
+    ESPN's real scoreboard for the day -- instead of trusting the LLM's
+    guess in sports_agent/nodes.py, which has no schedule data to go on and
+    gets it backwards constantly (confirmed live: a real "Braves @
+    Nationals" query -- Nationals hosting -- came back with the Braves, the
+    actual road team, labeled home). Getting this backwards isn't just a
+    display glitch: ratings.py's win_probability() adds a real home-field
+    rating bonus to whichever team is passed as home_team, so a swapped
+    orientation hands that edge to the wrong team and can flip who the
+    model favors.
+
+    Returns {"resolved": True, "home": <team_a or team_b>, "away": <the
+    other one>} when exactly one game on the scoreboard matches both team
+    names (one on each side), else {"resolved": False, "reason": ...} so
+    the caller can safely fall back to whatever it already had.
+    """
+    try:
+        board = get_scoreboard(sport, date)
+    except Exception as e:
+        return {"resolved": False, "reason": f"scoreboard fetch failed: {e}"}
+
+    games = board.get("games") if isinstance(board, dict) else None
+    if not games:
+        return {"resolved": False, "reason": "no games on the scoreboard for this date"}
+
+    a_norm, b_norm = _normalize_name(team_a), _normalize_name(team_b)
+
+    def _matches(query_norm: str, candidate: str) -> bool:
+        cand_norm = _normalize_name(candidate or "")
+        if not query_norm or not cand_norm:
+            return False
+        if query_norm == cand_norm or query_norm in cand_norm or cand_norm in query_norm:
+            return True
+        return bool(set(query_norm.split()) & set(cand_norm.split()))
+
+    matches = []
+    for g in games:
+        gh, ga = g.get("home_team") or "", g.get("away_team") or ""
+        if _matches(a_norm, gh) and _matches(b_norm, ga):
+            matches.append((team_a, team_b))
+        elif _matches(b_norm, gh) and _matches(a_norm, ga):
+            matches.append((team_b, team_a))
+
+    if len(matches) == 1:
+        home, away = matches[0]
+        return {"resolved": True, "home": home, "away": away}
+    if len(matches) > 1:
+        return {"resolved": False, "reason": "matched more than one game on the scoreboard"}
+    return {"resolved": False, "reason": "no scoreboard game matched both teams"}
+
+
 def _flatten_stats(stat_list) -> dict:
     out = {}
     for s in stat_list or []:
@@ -358,6 +410,62 @@ def get_team_roster(sport: str, team_name: str) -> dict:
             })
 
     return {"sport": normalize_sport(sport), "team": team_name, "espn_team_id": team_id, "roster": athletes}
+
+
+def get_team_injuries(sport: str, team_name: str) -> dict:
+    """Current injury report for one team, from ESPN's team endpoint --
+    feeds the automatic situational-adjustment sync in backend/analytics.py
+    (run_injury_sync_cycle) instead of requiring the manual POST
+    /team-status entries this app started with.
+
+    UNVERIFIED SHAPE (see module docstring): built at the same
+    `{SITE_BASE}/.../teams/{id}/<suffix>` URL pattern already confirmed
+    live for /roster and /statistics, but ESPN's injuries payload is known
+    to sometimes list players inline and sometimes as {"$ref": ...}
+    pointers needing a follow-up request -- this handles both. If this
+    comes back empty for a team you know has a real injury report, that's
+    the signal the shape has drifted; see GET /espn/debug/injuries-raw.
+    """
+    cfg = _espn_cfg(sport)
+    if not cfg:
+        return {"error": f"No ESPN mapping for sport '{sport}'"}
+    try:
+        team_id = _resolve_team_id(sport, team_name)
+    except Exception as e:
+        return {"error": f"Could not load ESPN team list: {e}"}
+    if not team_id:
+        return {"error": f"Couldn't match '{team_name}' to an ESPN team"}
+
+    try:
+        data = _get(f"{SITE_BASE}/{cfg['sport']}/{cfg['league']}/teams/{team_id}/injuries")
+    except Exception as e:
+        return {"error": f"ESPN injuries request failed: {e}"}
+
+    raw_items = data.get("items") if isinstance(data, dict) else None
+    if raw_items is None:
+        raw_items = data if isinstance(data, list) else []
+
+    injuries = []
+    for item in raw_items[:20]:  # bounded -- one team's injury report is never huge
+        entry = item
+        if isinstance(item, dict) and "$ref" in item and len(item) == 1:
+            try:
+                entry = _get(item["$ref"])
+            except Exception:
+                continue
+        if not isinstance(entry, dict):
+            continue
+        athlete = entry.get("athlete") or {}
+        status = (
+            entry.get("status")
+            or (entry.get("type") or {}).get("description")
+            or (entry.get("type") or {}).get("name")
+        )
+        name = athlete.get("displayName") or entry.get("longComment") or entry.get("shortComment")
+        if name and status:
+            injuries.append({"player": name, "status": status})
+
+    return {"sport": normalize_sport(sport), "team": team_name, "espn_team_id": team_id, "injuries": injuries}
 
 
 

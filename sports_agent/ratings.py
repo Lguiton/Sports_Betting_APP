@@ -149,6 +149,15 @@ def _ensure_schema(conn) -> None:
         )
         """
     )
+    # 'source' distinguishes entries you typed yourself ('manual', the
+    # default) from ones written automatically by the ESPN injury sync
+    # ('espn_auto') -- see ratings.replace_auto_team_status -- so the
+    # automatic sync can safely delete-and-replace only its own rows on
+    # every run without ever touching something you entered by hand.
+    try:
+        conn.execute("ALTER TABLE team_status ADD COLUMN IF NOT EXISTS source VARCHAR DEFAULT 'manual'")
+    except duckdb.Error:
+        pass
 
     conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_model_predictions_id START 1")
     conn.execute(
@@ -338,18 +347,48 @@ def get_active_status_adjustment(sport: str, team: str, conn=None) -> dict:
 
 
 def set_team_status(sport: str, team: str, adjustment: float, note: Optional[str] = None,
-                     expires_at: Optional[str] = None) -> dict:
+                     expires_at: Optional[str] = None, source: str = "manual") -> dict:
     sport = normalize_sport(sport)
     adjustment = max(-STATUS_ADJUSTMENT_CAP, min(STATUS_ADJUSTMENT_CAP, adjustment))
     conn = _connect()
     try:
         row = conn.execute(
-            "INSERT INTO team_status (sport, team, adjustment, note, expires_at) "
-            "VALUES (?, ?, ?, ?, ?) RETURNING id",
-            [sport, team, adjustment, note, expires_at],
+            "INSERT INTO team_status (sport, team, adjustment, note, expires_at, source) "
+            "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+            [sport, team, adjustment, note, expires_at, source],
         ).fetchone()
         return {"id": row[0], "sport": sport, "team": team, "adjustment": adjustment,
-                "note": note, "expires_at": expires_at}
+                "note": note, "expires_at": expires_at, "source": source}
+    finally:
+        conn.close()
+
+
+def replace_auto_team_status(sport: str, team: str, adjustment: float, note: Optional[str],
+                              expires_at: Optional[str] = None, source: str = "espn_auto") -> dict:
+    """Deletes any existing team_status rows for this team+sport+source and
+    inserts a fresh one (or inserts nothing if adjustment is 0 with no
+    note) -- so an automatic sync job (e.g. sports_agent's ESPN injury
+    sync) can re-run on every poll and stay current without piling up
+    duplicate adjustments each cycle. Rows with a different `source`
+    (manual entries you typed in yourself default to 'manual') are never
+    touched."""
+    sport = normalize_sport(sport)
+    adjustment = max(-STATUS_ADJUSTMENT_CAP, min(STATUS_ADJUSTMENT_CAP, adjustment))
+    conn = _connect()
+    try:
+        conn.execute(
+            "DELETE FROM team_status WHERE sport = ? AND team = ? AND source = ?",
+            [sport, team, source],
+        )
+        if adjustment == 0 and not note:
+            return {"sport": sport, "team": team, "adjustment": 0.0, "note": None, "cleared": True}
+        row = conn.execute(
+            "INSERT INTO team_status (sport, team, adjustment, note, expires_at, source) "
+            "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+            [sport, team, adjustment, note, expires_at, source],
+        ).fetchone()
+        return {"id": row[0], "sport": sport, "team": team, "adjustment": adjustment,
+                "note": note, "expires_at": expires_at, "source": source}
     finally:
         conn.close()
 
@@ -358,7 +397,7 @@ def list_team_status(sport: str, active_only: bool = True) -> list[dict]:
     sport = normalize_sport(sport)
     conn = _connect()
     try:
-        query = "SELECT id, team, adjustment, note, expires_at, created_at FROM team_status WHERE sport = ?"
+        query = "SELECT id, team, adjustment, note, expires_at, created_at, source FROM team_status WHERE sport = ?"
         params: list = [sport]
         if active_only:
             query += " AND (expires_at IS NULL OR expires_at >= ?)"
@@ -367,7 +406,8 @@ def list_team_status(sport: str, active_only: bool = True) -> list[dict]:
         rows = conn.execute(query, params).fetchall()
         return [
             {"id": r[0], "team": r[1], "adjustment": r[2], "note": r[3],
-             "expires_at": str(r[4]) if r[4] else None, "created_at": str(r[5])}
+             "expires_at": str(r[4]) if r[4] else None, "created_at": str(r[5]),
+             "source": r[6] or "manual"}
             for r in rows
         ]
     finally:

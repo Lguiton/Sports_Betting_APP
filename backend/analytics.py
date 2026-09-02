@@ -19,6 +19,7 @@ from sports_agent.nodes import american_to_decimal, decimal_to_implied_prob, kel
 from sports_agent.ratings import (
     record_game_result, list_ratings, win_probability_breakdown, get_calibration,
     set_team_status, list_team_status, clear_team_status, normalize_sport, get_standings,
+    replace_auto_team_status,
 )
 from sports_agent import espn_stats
 
@@ -60,7 +61,7 @@ def _connect():
     # home_team/away_team, added in place -- older rows keep their freeform
     # `matchup` text, but structured team names are what let the line
     # tracker match an open bet to a live odds board and auto-fill CLV.
-    for col, ddl in [("home_team", "VARCHAR"), ("away_team", "VARCHAR")]:
+    for col, ddl in [("home_team", "VARCHAR"), ("away_team", "VARCHAR"), ("graded_by", "VARCHAR")]:
         try:
             conn.execute(f"ALTER TABLE bets ADD COLUMN IF NOT EXISTS {col} {ddl}")
         except duckdb.Error:
@@ -206,6 +207,168 @@ def get_ratings(sport: str):
 
 
 # ---------------------------------------------------------------------------
+# Auto-settlement: ESPN final scores -> ratings + moneyline bet grading,
+# on a schedule, instead of typing every result in by hand.
+# ---------------------------------------------------------------------------
+
+AUTO_SETTLE_INTERVAL_MINUTES = 20
+
+
+def _game_already_logged(conn, sport: str, home_team: str, away_team: str, game_date: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM game_results WHERE sport = ? AND lower(home_team) = lower(?) "
+        "AND lower(away_team) = lower(?) AND game_date = ?",
+        [sport, home_team, away_team, game_date],
+    ).fetchone()
+    return row is not None
+
+
+def run_auto_settlement_cycle() -> dict:
+    """Checks today's ESPN scoreboard for every supported sport, and for
+    any game that's gone Final: (1) logs the result into the Glicko-2
+    rating engine via record_game_result if it hasn't been logged yet
+    (game_results has no unique constraint, so this dedup check is what
+    stops the same final score from being applied to a team's rating on
+    every poll), and (2) auto-grades any pending *moneyline* bet on that
+    exact matchup by matching your free-text `selection` against the real
+    winner/loser team name.
+
+    Spread and total bets are deliberately left alone -- the app only
+    stores the selection as free text (e.g. "Patriots -3.5"), not a
+    structured line, so there's no safe way to auto-grade those without
+    risking a wrong grade. Those still use the manual Won/Lost/Push/Void
+    buttons in the Bet Journal, same as before this existed."""
+    conn = _connect()
+    try:
+        enabled = _get_setting(conn, "auto_settle_enabled", "true") == "true"
+    finally:
+        conn.close()
+    if not enabled:
+        return {"ran": False, "reason": "auto-settlement is disabled"}
+
+    today = date.today().isoformat()
+    games_logged = 0
+    bets_graded = 0
+
+    for sport in ODDS_SPORT_KEYS:
+        try:
+            board = espn_stats.get_scoreboard(sport)
+        except Exception:
+            continue
+        games = board.get("games") if isinstance(board, dict) else None
+        if not games:
+            continue
+
+        for g in games:
+            status_text = (g.get("status") or "").lower()
+            if "final" not in status_text:
+                continue
+            home_team, away_team = g.get("home_team"), g.get("away_team")
+            home_score_raw, away_score_raw = g.get("home_score"), g.get("away_score")
+            if not home_team or not away_team or home_score_raw is None or away_score_raw is None:
+                continue
+            try:
+                home_score, away_score = float(home_score_raw), float(away_score_raw)
+            except (TypeError, ValueError):
+                continue
+            if home_score == away_score:
+                continue  # record_game_result refuses ties -- nothing to do
+
+            game_date = (g.get("date") or today)[:10]
+            sport_norm = normalize_sport(sport)
+
+            conn = _connect()
+            try:
+                already_logged = _game_already_logged(conn, sport_norm, home_team, away_team, game_date)
+            finally:
+                conn.close()
+
+            if not already_logged:
+                try:
+                    record_game_result(sport, home_team, away_team, home_score, away_score, game_date)
+                    games_logged += 1
+                except ValueError:
+                    pass
+
+            winner = home_team if home_score > away_score else away_team
+            loser = away_team if winner == home_team else home_team
+
+            conn = _connect()
+            try:
+                pending = conn.execute(
+                    """
+                    SELECT id, selection, odds, stake FROM bets
+                    WHERE status = 'pending' AND bet_type = 'moneyline'
+                      AND sport = ? AND lower(home_team) = lower(?) AND lower(away_team) = lower(?)
+                    """,
+                    [sport_norm, home_team, away_team],
+                ).fetchall()
+                for bet_id, selection, odds, stake in pending:
+                    sel_lower = (selection or "").lower()
+                    if winner.lower() in sel_lower:
+                        new_status = "won"
+                        profit = round(stake * (american_to_decimal(odds) - 1), 2)
+                    elif loser.lower() in sel_lower:
+                        new_status = "lost"
+                        profit = -stake
+                    else:
+                        continue  # selection text doesn't clearly name either side -- leave for manual grading
+
+                    conn.execute(
+                        "UPDATE bets SET status = ?, result_profit = ?, graded_at = current_timestamp, "
+                        "graded_by = 'auto' WHERE id = ? AND status = 'pending'",
+                        [new_status, profit, bet_id],
+                    )
+                    bets_graded += 1
+            finally:
+                conn.close()
+
+    conn = _connect()
+    try:
+        _set_setting(conn, "auto_settle_last_run", datetime.now().isoformat())
+    finally:
+        conn.close()
+    return {"ran": True, "games_logged": games_logged, "bets_graded": bets_graded}
+
+
+class AutoSettleToggle(BaseModel):
+    enabled: bool
+
+
+@router.post("/auto-settle/enabled")
+def set_auto_settle(payload: AutoSettleToggle):
+    """Auto-settlement only reads ESPN's (free, unofficial) scoreboard and
+    your own already-logged bets, so it defaults ON -- unlike line
+    tracking, which hits a paid/rate-limited API. Turn it off here if you'd
+    rather grade everything by hand."""
+    conn = _connect()
+    try:
+        _set_setting(conn, "auto_settle_enabled", "true" if payload.enabled else "false")
+    finally:
+        conn.close()
+    return {"auto_settle_enabled": payload.enabled}
+
+
+@router.get("/auto-settle/status")
+def get_auto_settle_status():
+    conn = _connect()
+    try:
+        enabled = _get_setting(conn, "auto_settle_enabled", "true") == "true"
+        last_run = _get_setting(conn, "auto_settle_last_run", "")
+    finally:
+        conn.close()
+    return {"auto_settle_enabled": enabled, "last_run": last_run or None,
+            "poll_interval_minutes": AUTO_SETTLE_INTERVAL_MINUTES}
+
+
+@router.post("/auto-settle/run")
+def trigger_auto_settle():
+    """Run one auto-settlement pass right now instead of waiting for the
+    next scheduled poll -- handy for testing or right after a game ends."""
+    return run_auto_settlement_cycle()
+
+
+# ---------------------------------------------------------------------------
 # Bet journal
 # ---------------------------------------------------------------------------
 
@@ -236,7 +399,7 @@ def list_bets(status: Optional[str] = None, sport: Optional[str] = None, limit: 
     try:
         query = (
             "SELECT id, sport, matchup, bet_type, selection, odds, stake, to_win, status, "
-            "result_profit, closing_odds, clv_pct, placed_at, graded_at, notes, home_team, away_team "
+            "result_profit, closing_odds, clv_pct, placed_at, graded_at, notes, home_team, away_team, graded_by "
             "FROM bets WHERE 1=1"
         )
         params: list = []
@@ -251,7 +414,7 @@ def list_bets(status: Optional[str] = None, sport: Optional[str] = None, limit: 
 
         cols = ["id", "sport", "matchup", "bet_type", "selection", "odds", "stake", "to_win",
                 "status", "result_profit", "closing_odds", "clv_pct", "placed_at", "graded_at", "notes",
-                "home_team", "away_team"]
+                "home_team", "away_team", "graded_by"]
         rows = conn.execute(query, params).fetchall()
         return [_row_to_dict(cols, row) for row in rows]
     finally:
@@ -295,7 +458,8 @@ def grade_bet(bet_id: int, grade: BetGradeIn):
         conn.execute(
             """
             UPDATE bets
-            SET status = ?, result_profit = ?, closing_odds = ?, clv_pct = ?, graded_at = current_timestamp
+            SET status = ?, result_profit = ?, closing_odds = ?, clv_pct = ?, graded_at = current_timestamp,
+                graded_by = 'manual'
             WHERE id = ?
             """,
             [grade.status, profit, closing_odds, clv_pct, bet_id],
@@ -501,6 +665,133 @@ def delete_team_status(status_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Automatic injury sync: turns ESPN's real injury reports into the same
+# situational adjustment system above, instead of requiring every entry to
+# be typed in by hand via POST /team-status.
+# ---------------------------------------------------------------------------
+
+INJURY_SYNC_INTERVAL_MINUTES = 60
+
+# A blunt heuristic, not a real depth-chart model: a fixed rating penalty
+# per player by ESPN's designation, summed per team and capped. It has no
+# idea whether the player out is a starting quarterback or a backup
+# long-snapper -- treat the resulting adjustment as a nudge, not gospel.
+# A manual team-status note you enter yourself (source='manual') is
+# unaffected and always adds on top of this.
+_INJURY_STATUS_WEIGHTS = {
+    "out": -8.0, "injured reserve": -8.0, "ir": -8.0,
+    "doubtful": -4.0, "questionable": -2.0,
+}
+_INJURY_ADJUSTMENT_FLOOR = -30.0  # a long injury list shouldn't be able to swamp the rating
+
+
+def _injury_weight(status: str) -> float:
+    s = (status or "").lower()
+    for key, weight in _INJURY_STATUS_WEIGHTS.items():
+        if key in s:
+            return weight
+    return 0.0
+
+
+def run_injury_sync_cycle() -> dict:
+    """Pulls today's ESPN scoreboard for every supported sport, fetches
+    each of today's playing teams' current injury report, and turns it
+    into an automatic situational adjustment via
+    ratings.replace_auto_team_status -- so win_probability() reacts to
+    real injury news without you typing it in. Re-running this clears and
+    re-derives every 'espn_auto'-sourced adjustment each time, so a
+    player coming off the injury report clears its penalty automatically
+    too, not just additions."""
+    conn = _connect()
+    try:
+        enabled = _get_setting(conn, "injury_sync_enabled", "true") == "true"
+    finally:
+        conn.close()
+    if not enabled:
+        return {"ran": False, "reason": "injury sync is disabled"}
+
+    teams_synced = 0
+    for sport in ODDS_SPORT_KEYS:
+        try:
+            board = espn_stats.get_scoreboard(sport)
+        except Exception:
+            continue
+        games = board.get("games") if isinstance(board, dict) else None
+        if not games:
+            continue
+
+        team_names = set()
+        for g in games:
+            if g.get("home_team"):
+                team_names.add(g["home_team"])
+            if g.get("away_team"):
+                team_names.add(g["away_team"])
+
+        for team in team_names:
+            try:
+                report = espn_stats.get_team_injuries(sport, team)
+            except Exception:
+                continue
+            injuries = report.get("injuries") or []
+
+            total_adj = 0.0
+            notes = []
+            for inj in injuries:
+                w = _injury_weight(inj.get("status", ""))
+                if w != 0.0:
+                    total_adj += w
+                    notes.append(f"{inj.get('player')} ({inj.get('status')})")
+            total_adj = max(_INJURY_ADJUSTMENT_FLOOR, total_adj)
+            note = ("Auto (ESPN): " + ", ".join(notes[:6])) if notes else None
+
+            try:
+                replace_auto_team_status(sport, team, total_adj, note, expires_at=None, source="espn_auto")
+                teams_synced += 1
+            except Exception:
+                continue
+
+    conn = _connect()
+    try:
+        _set_setting(conn, "injury_sync_last_run", datetime.now().isoformat())
+    finally:
+        conn.close()
+    return {"ran": True, "teams_synced": teams_synced}
+
+
+class InjurySyncToggle(BaseModel):
+    enabled: bool
+
+
+@router.post("/injury-sync/enabled")
+def set_injury_sync(payload: InjurySyncToggle):
+    conn = _connect()
+    try:
+        _set_setting(conn, "injury_sync_enabled", "true" if payload.enabled else "false")
+    finally:
+        conn.close()
+    return {"injury_sync_enabled": payload.enabled}
+
+
+@router.get("/injury-sync/status")
+def get_injury_sync_status():
+    conn = _connect()
+    try:
+        enabled = _get_setting(conn, "injury_sync_enabled", "true") == "true"
+        last_run = _get_setting(conn, "injury_sync_last_run", "")
+    finally:
+        conn.close()
+    return {"injury_sync_enabled": enabled, "last_run": last_run or None,
+            "poll_interval_minutes": INJURY_SYNC_INTERVAL_MINUTES}
+
+
+@router.post("/injury-sync/run")
+def trigger_injury_sync():
+    """Run one injury-sync pass right now instead of waiting for the next
+    scheduled poll."""
+    return run_injury_sync_cycle()
+
+
+# ---------------------------------------------------------------------------
 # Explainability: why a pick was favored
 # ---------------------------------------------------------------------------
 
@@ -629,6 +920,56 @@ def line_movement(sport: str, home_team: str, away_team: str):
 
     return {"sport": normalize_sport(sport), "matchup": f"{away_team} @ {home_team}",
             "snapshots": snapshots, "movement": movement}
+
+
+@router.get("/line-movement/alerts")
+def line_movement_alerts(min_shift_pct: float = 5.0):
+    """Steam-move flags across every matchup currently being tracked (any
+    matchup with a captured odds snapshot -- see run_line_tracking_cycle),
+    instead of GET /line-movement's one-matchup-at-a-time lookup. Requires
+    line tracking to be enabled and to have captured at least two
+    snapshots for a matchup before it can detect a shift."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT sport, home_team, away_team, best_home_price, captured_at
+            FROM odds_snapshots
+            WHERE best_home_price IS NOT NULL
+            ORDER BY sport, home_team, away_team, captured_at ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    by_matchup: dict = {}
+    for sport, home_team, away_team, price, captured_at in rows:
+        by_matchup.setdefault((sport, home_team, away_team), []).append((price, captured_at))
+
+    alerts = []
+    for (sport, home_team, away_team), points in by_matchup.items():
+        if len(points) < 2:
+            continue
+        first_price, _ = points[0]
+        last_price, last_captured = points[-1]
+        shift = round(
+            decimal_to_implied_prob(american_to_decimal(last_price))
+            - decimal_to_implied_prob(american_to_decimal(first_price)), 2
+        )
+        if abs(shift) >= min_shift_pct:
+            alerts.append({
+                "sport": sport,
+                "matchup": f"{away_team} @ {home_team}",
+                "home_team": home_team,
+                "away_team": away_team,
+                "home_implied_prob_shift_pct": shift,
+                "direction": "toward home" if shift > 0 else "toward away",
+                "snapshots": len(points),
+                "latest_snapshot": str(last_captured),
+            })
+
+    alerts.sort(key=lambda a: abs(a["home_implied_prob_shift_pct"]), reverse=True)
+    return {"min_shift_pct": min_shift_pct, "alerts": alerts}
 
 
 class LineTrackingToggle(BaseModel):
@@ -886,6 +1227,16 @@ def espn_roster(sport: str, team: str):
     return espn_stats.get_team_roster(sport, team)
 
 
+@router.get("/espn/injuries")
+def espn_injuries(sport: str = "NFL", team: str = ""):
+    """Current ESPN injury report for one team -- the same data the
+    automatic injury sync (see run_injury_sync_cycle) uses to adjust
+    ratings, exposed directly for the dashboard/debugging."""
+    if not team:
+        raise HTTPException(status_code=400, detail="team is required")
+    return espn_stats.get_team_injuries(sport, team)
+
+
 @router.get("/espn/player-stats")
 def espn_player_stats(sport: str, team: str, player: str):
     """One player's season stats, looked up on demand by name against their
@@ -1003,6 +1354,30 @@ def espn_debug_player_stats_raw(sport: str, team: str, player: str):
         "matched_player": match,
         "attempts": results,
     }
+
+@router.get("/espn/debug/injuries-raw")
+def espn_debug_injuries_raw(sport: str, team: str):
+    """Raw, unparsed ESPN injuries payload for one team -- pull this if
+    GET /espn/injuries or the auto injury sync ever comes back empty for a
+    team you know has a real injury report; see get_team_injuries's
+    docstring for why the shape is unverified."""
+    cfg = espn_stats._espn_cfg(sport)
+    if not cfg:
+        raise HTTPException(status_code=400, detail=f"No ESPN mapping for sport '{sport}'")
+    try:
+        team_id = espn_stats._resolve_team_id(sport, team)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not load ESPN team list: {e}")
+    if not team_id:
+        raise HTTPException(status_code=404, detail=f"Couldn't match '{team}' to an ESPN team")
+    try:
+        data = espn_stats._get(
+            f"{espn_stats.SITE_BASE}/{cfg['sport']}/{cfg['league']}/teams/{team_id}/injuries"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return data
+
 
 @router.get("/espn/debug/gamelog-shape")
 def espn_debug_gamelog_shape(sport: str, team: str, player: str):

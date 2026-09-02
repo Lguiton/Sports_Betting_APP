@@ -302,3 +302,132 @@ triggers a spurious restart) -- Python changes now take effect automatically
 like the frontend already did, instead of needing a manual restart every
 time (a recurring source of confusion this session). Needs `watchfiles`
 installed (`Update Backend Dependencies.bat`).
+
+## Home/away orientation was backwards for some matchups (fixed)
+
+**Symptom:** For a real Braves @ Nationals game (Nationals hosting), the
+dashboard showed the Braves -- the actual road team -- as the home team:
+Monte Carlo's "Home Win Probability" and "Median Projected Score" both had
+the Braves on the home side, and the AI narrative said the Braves were
+"favored... with a home win probability of 57.8%."
+
+**Root cause:** `home_team`/`away_team` were never grounded in real
+schedule data -- the tool-calling LLM in `sports_agent/nodes.py` decided who
+was home purely from how the user phrased the matchup (e.g. word order in
+"Braves vs Nationals"), and had no way to know who was actually hosting.
+This is worse than a cosmetic swap: `ratings.py`'s `win_probability()` adds
+a real home-field rating bonus (`params["home_adv"]`) to whichever team is
+passed as `home_team`, so a backwards orientation hands that edge to the
+wrong team and can shift (or even flip) who the model favors.
+
+**Fix:** Added `espn_stats.resolve_matchup_home_away(sport, team_a,
+team_b, date=None)`, which looks up ESPN's real scoreboard for the day and
+returns which of the two teams is actually home, using the same
+normalized fuzzy-name matching as player lookups. `nodes.py` now runs every
+tool call that carries `home_team`/`away_team` (`fetch_live_odds`,
+`predict_matchup_winner`, `run_monte_carlo_simulation`,
+`calculate_poisson_over_under`, and the auto-triggered Monte Carlo call
+that piggybacks on `predict_matchup_winner`) through
+`_grounded_tool_call()`, which swaps the two team names into the correct
+home/away slots when ESPN's scoreboard confidently disagrees with the
+LLM's guess. If ESPN's scoreboard can't confidently resolve it (no
+matching game found, or the two team names match more than one game),
+the LLM's original guess is left untouched rather than risking a wrong
+"correction."
+
+Verified offline with a stubbed scoreboard response (the exact real
+Braves/Nationals case) confirming the swap happens, a same-order case
+confirming an already-correct guess isn't touched, and a no-match case
+confirming an unresolvable matchup falls back untouched.
+
+## Enhancement round: auto-settlement, auto injury sync, steam alerts
+
+Before building anything here, actually read through `backend/analytics.py`
+in full (hadn't done that yet this session) and found two of the five
+originally-recommended features already existed in solid form: **Edge
+Radar** (`GET /edge-radar`, `EdgeRadar.tsx` -- scans the whole slate for
++EV vs. the market) and the **Bet Journal's P&L view**
+(`GET /performance`, `BetJournal.tsx` -- real win rate, ROI, avg CLV,
+bankroll curve). Nothing was rebuilt there. The three genuine gaps got
+built:
+
+### 1. Auto-settlement (`run_auto_settlement_cycle`, `backend/analytics.py`)
+
+A background poller (every 20 min, default ON) that checks ESPN's
+scoreboard for each supported sport and, for any game gone Final:
+- Logs the result into the Glicko-2 rating engine via
+  `record_game_result` -- but only if that exact (sport, home, away,
+  date) result isn't already in `game_results`, since that table has no
+  unique constraint and calling it twice would double-count the rating
+  update.
+- Auto-grades any **pending moneyline** bet on that matchup by matching
+  your free-text `selection` against the real winner/loser team name.
+  Spread/total bets are deliberately left for the manual Won/Lost/Push/
+  Void buttons -- the app only stores selection as free text, not a
+  structured line, so auto-grading those isn't safe.
+
+New: `POST/GET /auto-settle/enabled`, `/auto-settle/status`,
+`POST /auto-settle/run` (manual trigger). Bets now carry a `graded_by`
+column (`manual` vs `auto`), shown as a column in the Bet Journal history
+table.
+
+### 2. Automatic injury sync (`run_injury_sync_cycle`, `backend/analytics.py`)
+
+Team-status situational adjustments (`win_probability()`'s injury/
+suspension nudge) used to be 100% manual entry -- the code said so
+explicitly. A background poller (every 60 min, default ON) now pulls
+today's scoreboard, fetches each playing team's ESPN injury report
+(`espn_stats.get_team_injuries`, new -- same URL pattern as the
+already-working `/roster` and `/statistics` endpoints, but **unverified
+against a live response** the same way player-stats was before that got
+debugged against your real ESPN traffic; see `GET
+/espn/debug/injuries-raw` if `GET /espn/injuries` ever comes back empty
+for a team you know has real injuries), and turns it into a rating
+adjustment: Out/IR -8, Doubtful -4, Questionable -2 per player, summed
+and floored at -30. This is a blunt heuristic, not a depth-chart model --
+it has no idea if the player out is a starter or third-stringer.
+
+To avoid piling up duplicate adjustments every hour, adjustments now
+carry a `source` (`manual` vs `espn_auto`); each sync cycle deletes and
+re-derives only its own `espn_auto` rows, so a recovered player's penalty
+clears automatically too. Manual entries you type in yourself are never
+touched. `RatingsPanel.tsx` tags auto entries "Auto -- ESPN" so you can
+tell them apart from your own notes.
+
+New: `GET /espn/injuries`, `GET /espn/debug/injuries-raw`,
+`POST/GET /injury-sync/enabled`, `/injury-sync/status`,
+`POST /injury-sync/run`.
+
+### 3. Steam alerts (`GET /line-movement/alerts`)
+
+Line movement tracking already existed (`GET /line-movement`,
+`steam_move` flag on a 5%+ implied-probability shift) but only for one
+matchup you already knew to look up. New endpoint scans every
+currently-tracked matchup (anything with 2+ captured odds snapshots) and
+returns just the ones that moved 5+ points, sorted by size of the move.
+Surfaced as a new "Steam Alerts" panel at the top of `LineMovement.tsx`,
+above the existing per-matchup lookup, so a move surfaces without typing
+in the game first.
+
+### Testing performed (offline, before any live retest)
+
+- `py_compile` on every touched Python file.
+- `ratings.py`'s new `replace_auto_team_status` exercised against a real
+  scratch DuckDB file: confirmed a manual entry survives alongside an
+  auto entry, confirmed a second sync with no injuries clears the auto
+  row without touching the manual one, confirmed 3 repeated syncs don't
+  pile up duplicate auto rows, confirmed the combined adjustment
+  (`get_active_status_adjustment`) sums both sources correctly.
+- Auto-settlement's winner/loser selection-matching and profit math,
+  the injury status→weight mapping, and the steam-alert grouping/shift
+  math were each exercised standalone against handwritten cases
+  (including the ambiguous-selection-text skip case) before being
+  trusted in the real cycle functions.
+- `tsc --noEmit` across the whole frontend: clean, no type errors.
+
+Not yet verified live (need a real backend run + real ESPN traffic,
+same caveat as everything else built against ESPN's unofficial API this
+session): whether `get_team_injuries`'s URL/shape assumption is actually
+right. If `GET /espn/injuries` comes back empty for a team with known
+injuries, paste `GET /espn/debug/injuries-raw?sport=...&team=...`'s
+output back and it'll get fixed the same way player-stats did.

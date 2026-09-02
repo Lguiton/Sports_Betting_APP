@@ -24,6 +24,7 @@ type Bet = {
   notes: string | null;
   home_team: string | null;
   away_team: string | null;
+  graded_by: string | null;
 };
 
 type Performance = {
@@ -269,6 +270,7 @@ export default function BetJournal() {
                 <th className="py-2 pr-3">Result</th>
                 <th className="py-2 pr-3">P/L</th>
                 <th className="py-2 pr-3">CLV</th>
+                <th className="py-2 pr-3">Graded</th>
               </tr>
             </thead>
             <tbody>
@@ -283,6 +285,9 @@ export default function BetJournal() {
                     {bet.result_profit != null ? `${bet.result_profit >= 0 ? "+" : ""}$${bet.result_profit}` : "--"}
                   </td>
                   <td className="py-2 pr-3">{bet.clv_pct != null ? `${bet.clv_pct}%` : "--"}</td>
+                  <td className="py-2 pr-3 text-[10px] text-slate-500 uppercase">
+                    {bet.graded_by === "auto" ? "Auto (ESPN)" : bet.graded_by === "manual" ? "Manual" : "--"}
+                  </td>
                 </tr>
               ))}
             </tbody>

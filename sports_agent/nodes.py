@@ -4,6 +4,7 @@ import duckdb
 from langchain_core.messages import AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from sports_agent.state import SportsAgentState
+from sports_agent import espn_stats
 from sports_agent.tools import (
     fetch_live_odds, 
     predict_matchup_winner, 
@@ -65,6 +66,48 @@ def tool_payload(tool_result):
         try: return json.loads(content)
         except json.JSONDecodeError: return {"result": content}
     return content
+
+def _ground_home_away(args: dict) -> dict:
+    """The tool-calling LLM has no real schedule data -- it decides
+    home_team/away_team purely from how the user phrased the matchup, and
+    gets it backwards often (confirmed live: "Braves @ Nationals," with the
+    Nationals hosting, came back with the Braves -- the actual road team --
+    labeled home). That's not just a display bug: ratings.py's
+    win_probability() adds a real home-field rating bonus to whichever team
+    is passed as home_team, so a swapped orientation can flip who the model
+    actually favors. Cross-check against ESPN's real scoreboard for the day
+    and correct the orientation before any tool runs the numbers; if ESPN's
+    scoreboard can't confidently resolve it (no game found, ambiguous
+    match, request failed), leave the LLM's guess alone rather than risk a
+    wrong "correction"."""
+    home_team = args.get("home_team")
+    away_team = args.get("away_team")
+    sport = args.get("sport", "NFL")
+    if not home_team or not away_team:
+        return args
+    try:
+        check = espn_stats.resolve_matchup_home_away(sport, home_team, away_team)
+    except Exception:
+        return args
+    if check.get("resolved") and check.get("home") != home_team:
+        corrected = dict(args)
+        corrected["home_team"] = check["home"]
+        corrected["away_team"] = check["away"]
+        return corrected
+    return args
+
+
+def _grounded_tool_call(tc: dict) -> dict:
+    """Returns tc with its args' home_team/away_team corrected via
+    _ground_home_away, without mutating the original tool_call dict."""
+    args = tc.get("args") or {}
+    if "home_team" in args and "away_team" in args:
+        corrected = _ground_home_away(args)
+        if corrected is not args:
+            tc = dict(tc)
+            tc["args"] = corrected
+    return tc
+
 
 # Bulletproof Synthesis Layer
 async def synthesize_final_response(state: SportsAgentState, tool_data: dict) -> dict:
@@ -150,10 +193,10 @@ async def all_models_node(state: SportsAgentState) -> dict:
         for tool_call in res.tool_calls:
             name = tool_call["name"]
             try:
-                if name == "fetch_live_odds": combined_data["odds"] = tool_payload(await fetch_live_odds.ainvoke(tool_call))
-                elif name == "predict_matchup_winner": combined_data["prediction"] = tool_payload(await predict_matchup_winner.ainvoke(tool_call))
-                elif name == "run_monte_carlo_simulation": combined_data["monte_carlo"] = tool_payload(await run_monte_carlo_simulation.ainvoke(tool_call))
-                elif name == "calculate_poisson_over_under": combined_data["poisson"] = tool_payload(await calculate_poisson_over_under.ainvoke(tool_call))
+                if name == "fetch_live_odds": combined_data["odds"] = tool_payload(await fetch_live_odds.ainvoke(_grounded_tool_call(tool_call)))
+                elif name == "predict_matchup_winner": combined_data["prediction"] = tool_payload(await predict_matchup_winner.ainvoke(_grounded_tool_call(tool_call)))
+                elif name == "run_monte_carlo_simulation": combined_data["monte_carlo"] = tool_payload(await run_monte_carlo_simulation.ainvoke(_grounded_tool_call(tool_call)))
+                elif name == "calculate_poisson_over_under": combined_data["poisson"] = tool_payload(await calculate_poisson_over_under.ainvoke(_grounded_tool_call(tool_call)))
             except Exception as e:
                 combined_data[name + "_error"] = str(e)
                 
@@ -205,9 +248,9 @@ async def data_science_node(state: SportsAgentState) -> dict:
     if res.tool_calls:
         for tc in res.tool_calls:
             name = tc["name"]
-            if name == "run_monte_carlo_simulation": data["monte_carlo"] = tool_payload(await run_monte_carlo_simulation.ainvoke(tc))
-            elif name == "statsmodels_spread_regression": data["regression"] = tool_payload(await statsmodels_spread_regression.ainvoke(tc))
-            elif name == "calculate_poisson_over_under": data["poisson"] = tool_payload(await calculate_poisson_over_under.ainvoke(tc))
+            if name == "run_monte_carlo_simulation": data["monte_carlo"] = tool_payload(await run_monte_carlo_simulation.ainvoke(_grounded_tool_call(tc)))
+            elif name == "statsmodels_spread_regression": data["regression"] = tool_payload(await statsmodels_spread_regression.ainvoke(_grounded_tool_call(tc)))
+            elif name == "calculate_poisson_over_under": data["poisson"] = tool_payload(await calculate_poisson_over_under.ainvoke(_grounded_tool_call(tc)))
             
     print(f"\n--- TOOL DEBUG DATA (Data Science Node) ---\n{json.dumps(data, indent=2)}\n")
     return await synthesize_final_response(state, data)
@@ -222,9 +265,10 @@ async def odds_ev_node(state: SportsAgentState) -> dict:
     if res.tool_calls:
         for tc in res.tool_calls:
             name = tc["name"]
-            if name == "fetch_live_odds": data["odds"] = tool_payload(await fetch_live_odds.ainvoke(tc))
+            if name == "fetch_live_odds": data["odds"] = tool_payload(await fetch_live_odds.ainvoke(_grounded_tool_call(tc)))
             elif name == "predict_matchup_winner":
-                data["prediction"] = tool_payload(await predict_matchup_winner.ainvoke(tc))
+                grounded_tc = _grounded_tool_call(tc)
+                data["prediction"] = tool_payload(await predict_matchup_winner.ainvoke(grounded_tc))
                 # Deterministically run the Monte Carlo engine on the same
                 # matchup too, instead of relying on the LLM to separately
                 # decide to call it. This is what feeds the Simulation tab --
@@ -232,7 +276,10 @@ async def odds_ev_node(state: SportsAgentState) -> dict:
                 # here) never populates home/away_win_probability or
                 # median_projected_score, and the Simulation tab sits on its
                 # "Awaiting simulation parameters" empty state forever.
-                mc_args = tc.get("args", {}) or {}
+                # Reuses grounded_tc's already-corrected home/away so the
+                # prediction and simulation panels can never disagree about
+                # who's actually hosting.
+                mc_args = grounded_tc.get("args", {}) or {}
                 mc_call = {
                     "name": "run_monte_carlo_simulation",
                     "args": {
@@ -245,7 +292,7 @@ async def odds_ev_node(state: SportsAgentState) -> dict:
                 }
                 data["monte_carlo"] = tool_payload(await run_monte_carlo_simulation.ainvoke(mc_call))
             elif name == "run_monte_carlo_simulation" and "monte_carlo" not in data:
-                data["monte_carlo"] = tool_payload(await run_monte_carlo_simulation.ainvoke(tc))
+                data["monte_carlo"] = tool_payload(await run_monte_carlo_simulation.ainvoke(_grounded_tool_call(tc)))
             
     print(f"\n--- TOOL DEBUG DATA (Odds Node) ---\n{json.dumps(data, indent=2)}\n")
     return await synthesize_final_response(state, data)

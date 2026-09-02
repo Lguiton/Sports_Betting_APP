@@ -7,7 +7,7 @@ import { Trophy, X } from "lucide-react";
 const backendUrl = () => process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
 type Rating = { team: string; rating: number; rd: number; confidence: "High" | "Medium" | "Low"; games_played: number; last_updated: string };
-type TeamStatus = { id: number; team: string; adjustment: number; note: string | null; expires_at: string | null; created_at: string };
+type TeamStatus = { id: number; team: string; adjustment: number; note: string | null; expires_at: string | null; created_at: string; source?: string };
 
 const EMPTY_FORM = { sport: "NFL", home_team: "", away_team: "", home_score: "", away_score: "" };
 const EMPTY_STATUS_FORM = { team: "", adjustment: "", note: "", expires_at: "" };
@@ -225,6 +225,11 @@ export default function RatingsPanel() {
                     <span className={s.adjustment < 0 ? "text-red-400" : "text-[#00FF5B]"}>
                       {s.adjustment > 0 ? "+" : ""}{s.adjustment}
                     </span>
+                    {s.source === "espn_auto" && (
+                      <span className="text-[9px] text-slate-500 border border-[#1C212B] rounded px-1 py-[1px] ml-1 uppercase">
+                        Auto -- ESPN
+                      </span>
+                    )}
                     {s.note && <span className="text-slate-500"> -- {s.note}</span>}
                   </div>
                   <button onClick={() => removeStatus(s.id)} className="text-slate-600 hover:text-red-400">

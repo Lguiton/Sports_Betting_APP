@@ -10,7 +10,12 @@ import re
 from sports_agent.graph import sports_agent_app
 from sports_agent.nodes import kelly_criterion, calculate_ev
 from schemas import ChatRequest
-from backend.analytics import router as analytics_router, run_line_tracking_cycle, LINE_TRACKING_INTERVAL_MINUTES
+from backend.analytics import (
+    router as analytics_router,
+    run_line_tracking_cycle, LINE_TRACKING_INTERVAL_MINUTES,
+    run_auto_settlement_cycle, AUTO_SETTLE_INTERVAL_MINUTES,
+    run_injury_sync_cycle, INJURY_SYNC_INTERVAL_MINUTES,
+)
 
 
 async def _line_tracking_loop():
@@ -26,13 +31,42 @@ async def _line_tracking_loop():
         await asyncio.sleep(LINE_TRACKING_INTERVAL_MINUTES * 60)
 
 
+async def _auto_settle_loop():
+    """Background poller that logs ESPN final scores into the rating
+    engine and auto-grades pending moneyline bets. Defaults ON -- see
+    POST /auto-settle/enabled in backend/analytics.py to turn it off."""
+    while True:
+        try:
+            await asyncio.to_thread(run_auto_settlement_cycle)
+        except Exception:
+            traceback.print_exc()
+        await asyncio.sleep(AUTO_SETTLE_INTERVAL_MINUTES * 60)
+
+
+async def _injury_sync_loop():
+    """Background poller that turns ESPN's real injury reports into
+    automatic situational rating adjustments. Defaults ON -- see
+    POST /injury-sync/enabled in backend/analytics.py to turn it off."""
+    while True:
+        try:
+            await asyncio.to_thread(run_injury_sync_cycle)
+        except Exception:
+            traceback.print_exc()
+        await asyncio.sleep(INJURY_SYNC_INTERVAL_MINUTES * 60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(_line_tracking_loop())
+    tasks = [
+        asyncio.create_task(_line_tracking_loop()),
+        asyncio.create_task(_auto_settle_loop()),
+        asyncio.create_task(_injury_sync_loop()),
+    ]
     try:
         yield
     finally:
-        task.cancel()
+        for task in tasks:
+            task.cancel()
 
 
 app = FastAPI(title="Eivanta Analytics Sports Betting API", lifespan=lifespan)

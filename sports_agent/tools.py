@@ -146,8 +146,12 @@ def run_monte_carlo_simulation(home_team: str, away_team: str, sport: str = "NFL
     mu_a -= edge * spread
 
     for _ in range(iterations):
-        h_score = max(0, int(random.normalvariate(mu_h, sig_h)))
-        a_score = max(0, int(random.normalvariate(mu_a, sig_a)))
+        # round(), not int(): truncation systematically biased every score
+        # ~0.5 points low on average (e.g. int(24.9) == 24), skewing the
+        # displayed median score for both teams without affecting the win
+        # probabilities themselves.
+        h_score = max(0, round(random.normalvariate(mu_h, sig_h)))
+        a_score = max(0, round(random.normalvariate(mu_a, sig_a)))
         
         home_scores.append(h_score)
         away_scores.append(a_score)

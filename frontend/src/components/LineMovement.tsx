@@ -17,6 +17,16 @@ type Snapshot = {
 type Movement = { home_implied_prob_shift_pct: number | null; steam_move: boolean } | null;
 type LineMovementResult = { matchup: string; snapshots: Snapshot[]; movement: Movement };
 type TrackingStatus = { line_tracking_enabled: boolean; last_run: string | null; poll_interval_minutes: number };
+type SteamAlert = {
+  sport: string;
+  matchup: string;
+  home_team: string;
+  away_team: string;
+  home_implied_prob_shift_pct: number;
+  direction: "toward home" | "toward away";
+  snapshots: number;
+  latest_snapshot: string;
+};
 
 export default function LineMovement() {
   const [sport, setSport] = useState("NFL");
@@ -26,6 +36,7 @@ export default function LineMovement() {
   const [status, setStatus] = useState<TrackingStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [alerts, setAlerts] = useState<SteamAlert[] | null>(null);
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -36,9 +47,19 @@ export default function LineMovement() {
     }
   }, []);
 
+  const refreshAlerts = useCallback(async () => {
+    try {
+      const res = await fetch(`${backendUrl()}/line-movement/alerts`);
+      if (res.ok) setAlerts((await res.json()).alerts);
+    } catch {
+      // silent -- backend may not be running yet
+    }
+  }, []);
+
   useEffect(() => {
     refreshStatus();
-  }, [refreshStatus]);
+    refreshAlerts();
+  }, [refreshStatus, refreshAlerts]);
 
   async function toggleTracking() {
     if (!status) return;
@@ -97,6 +118,37 @@ export default function LineMovement() {
           <Power size={12} />
           {status?.line_tracking_enabled ? "Tracking ON" : "Tracking OFF"}
         </button>
+      </div>
+
+      <div className="bg-[#0A0D14] border border-[#1C212B] rounded-2xl p-6">
+        <h3 className="text-xs font-bold text-[#00FF5B] uppercase tracking-widest mb-4">Steam Alerts</h3>
+        <p className="text-[11px] text-slate-500 mb-4 max-w-xl">
+          Every currently-tracked matchup (any matchup with an open bet) whose price has moved 5+ points of
+          implied probability since the first snapshot -- no need to already know which game to look up below.
+        </p>
+        {!alerts || alerts.length === 0 ? (
+          <p className="text-slate-600 text-xs italic">
+            No steam moves detected yet -- needs Tracking ON and at least two snapshots for a matchup.
+          </p>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {alerts.map((a) => (
+              <div
+                key={`${a.sport}-${a.matchup}`}
+                className="flex items-center justify-between text-[11px] border-t border-[#1C212B] pt-2"
+              >
+                <div className="text-slate-300">
+                  <span className="text-slate-500 uppercase text-[9px] mr-2">{a.sport}</span>
+                  <span className="text-white font-semibold">{a.matchup}</span>
+                </div>
+                <div className={a.home_implied_prob_shift_pct > 0 ? "text-[#00FF5B]" : "text-red-400"}>
+                  {a.home_implied_prob_shift_pct > 0 ? "+" : ""}
+                  {a.home_implied_prob_shift_pct}% ({a.direction})
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="bg-[#0A0D14] border border-[#1C212B] rounded-2xl p-6">
