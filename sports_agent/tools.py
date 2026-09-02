@@ -11,7 +11,7 @@ def fetch_live_odds(home_team: str, away_team: str, sport_key: str = "americanfo
     Args:
         home_team: The name of the home team (e.g., 'Chiefs').
         away_team: The name of the away team (e.g., 'Ravens').
-        sport_key: The Odds API sport key (e.g., 'americanfootball_nfl', 'baseball_mlb', 'basketball_nba').
+        sport_key: The Odds API sport key (e.g., 'americanfootball_nfl', 'baseball_mlb', 'basketball_nba', 'americanfootball_ncaaf').
     """
     if not ODDS_API_KEY:
         return {"error": "API Key Error: ODDS_API_KEY is missing from environment variables."}
@@ -53,50 +53,98 @@ def fetch_live_odds(home_team: str, away_team: str, sport_key: str = "americanfo
 
 @tool
 def predict_matchup_winner(home_team: str, away_team: str, sport: str = "NFL") -> dict:
-    """Predicts game outcome, win probabilities, and projected scores tailored to the specific sport."""
-    home_prob = round(random.uniform(0.42, 0.72), 2)
-    away_prob = round(1.0 - home_prob, 2)
-    
-    # Dynamic Scoring Baselines
-    sport_upper = sport.upper()
-    if "MLB" in sport_upper or "BASEBALL" in sport_upper:
-        home_score = round(random.uniform(3.0, 6.5), 1)
-        away_score = round(random.uniform(2.5, 5.5), 1)
-    elif "NBA" in sport_upper or "BASKETBALL" in sport_upper:
-        home_score = round(random.uniform(105.0, 118.0), 1)
-        away_score = round(random.uniform(102.0, 115.0), 1)
-    else: # Default to NFL
-        home_score = round(random.uniform(21.0, 31.0), 1)
-        away_score = round(random.uniform(17.0, 27.0), 1)
-    
-    favored = home_team if home_prob > away_prob else away_team
-    confidence = int(max(home_prob, away_prob) * 100)
+    """
+    Predicts game outcome and win probabilities from each team's Glicko-2
+    power rating (rating + confidence + rest days + any logged situational
+    notes -- see sports_agent/ratings.py). Ratings start neutral (1500,
+    wide uncertainty) and only move when you log real results via
+    POST /games/result -- so predictions get sharper the more games you log,
+    instead of being a coin flip forever. Every call is logged for later
+    backtesting -- see GET /calibration.
+    """
+    from sports_agent.ratings import win_probability_breakdown, normalize_sport, log_prediction
+
+    b = win_probability_breakdown(sport, home_team, away_team)
+    home_prob = b["home_win_probability"] / 100.0
+    away_prob = b["away_win_probability"] / 100.0
+
+    # Score baselines still use sport-typical ranges, but now nudged toward
+    # the favored side in proportion to the real rating edge, instead of
+    # being drawn completely independently of who the model favors.
+    sport_upper = normalize_sport(sport)
+    edge = home_prob - 0.5  # roughly -0.5 (huge underdog) .. +0.5 (huge favorite)
+    if sport_upper == "MLB":
+        base_h, base_a, spread = 4.5, 4.2, 3.0
+    elif sport_upper == "NBA":
+        base_h, base_a, spread = 111.0, 109.0, 14.0
+    elif sport_upper == "NCAAF":
+        base_h, base_a, spread = 28.0, 24.0, 15.0
+    else:  # NFL
+        base_h, base_a, spread = 23.0, 21.0, 12.0
+
+    home_score = round(max(0.0, base_h + edge * spread + random.uniform(-spread * 0.15, spread * 0.15)), 1)
+    away_score = round(max(0.0, base_a - edge * spread + random.uniform(-spread * 0.15, spread * 0.15)), 1)
+
+    favored = home_team if home_prob >= away_prob else away_team
+    confidence = round(max(home_prob, away_prob) * 100, 1)
+
+    try:
+        log_prediction(sport, home_team, away_team, b["home_win_probability"], favored, source="prediction")
+    except Exception:
+        pass  # never let telemetry logging break a live prediction
 
     return {
         "prediction_target": f"{home_team} vs {away_team}",
         "favored_team": favored,
         "win_probability": f"{confidence}%",
+        "home_win_probability": f"{round(home_prob * 100, 1)}%",
+        "away_win_probability": f"{round(away_prob * 100, 1)}%",
         "projected_score": f"{home_team} {home_score} - {away_team} {away_score}",
-        "market_edge": f"+{round(random.uniform(2.1, 6.9), 1)}% projected edge against closing line value."
+        "home_power_rating": b["home_rating"],
+        "away_power_rating": b["away_rating"],
+        "home_confidence": b["home_confidence"],
+        "away_confidence": b["away_confidence"],
+        "home_rest_days": b["home_rest_days"],
+        "away_rest_days": b["away_rest_days"],
+        "situational_notes": (b["home_situational_notes"] or []) + (b["away_situational_notes"] or []),
     }
 
 @tool
 def run_monte_carlo_simulation(home_team: str, away_team: str, sport: str = "NFL", iterations: int = 10000) -> dict:
-    """Simulates a matchup 10,000 times using sport-specific statistical variance to project win probabilities."""
+    """
+    Simulates a matchup 10,000 times using each team's Glicko-2 power rating
+    (see ratings.py) to bias the per-game scoring distributions, then
+    projects win probabilities and a median score. Ratings start neutral
+    (1500), so an unlogged matchup simulates as a true toss-up and gets
+    sharper the more real results you log via POST /games/result.
+    """
+    from sports_agent.ratings import win_probability, normalize_sport
+
     home_wins = 0
     away_wins = 0
     home_scores = []
     away_scores = []
-    
+
+    # Glicko-2-implied win probability sets how far the scoring means get
+    # pulled toward the favored side -- so this stays consistent with
+    # predict_matchup_winner instead of drawing independent random noise.
+    home_prob = win_probability(sport, home_team, away_team)
+    edge = home_prob - 0.5  # -0.5 (big underdog) .. +0.5 (big favorite)
+
     # Dynamic Variance Settings (Mean, Standard Deviation)
-    sport_upper = sport.upper()
-    if "MLB" in sport_upper or "BASEBALL" in sport_upper:
-        mu_h, sig_h, mu_a, sig_a = 4.8, 2.5, 4.2, 2.2
-    elif "NBA" in sport_upper or "BASKETBALL" in sport_upper:
-        mu_h, sig_h, mu_a, sig_a = 112.5, 12.0, 108.5, 11.5
-    else: # Default NFL
-        mu_h, sig_h, mu_a, sig_a = 24.5, 6.2, 21.5, 5.8
-    
+    sport_upper = normalize_sport(sport)
+    if sport_upper == "MLB":
+        mu_h, sig_h, mu_a, sig_a, spread = 4.8, 2.5, 4.2, 2.2, 2.5
+    elif sport_upper == "NBA":
+        mu_h, sig_h, mu_a, sig_a, spread = 112.5, 12.0, 108.5, 11.5, 16.0
+    elif sport_upper == "NCAAF":
+        mu_h, sig_h, mu_a, sig_a, spread = 30.0, 10.5, 25.0, 9.5, 17.0
+    else:  # Default NFL
+        mu_h, sig_h, mu_a, sig_a, spread = 24.5, 6.2, 21.5, 5.8, 10.0
+
+    mu_h += edge * spread
+    mu_a -= edge * spread
+
     for _ in range(iterations):
         h_score = max(0, int(random.normalvariate(mu_h, sig_h)))
         a_score = max(0, int(random.normalvariate(mu_a, sig_a)))
@@ -256,6 +304,12 @@ def log_wager_to_duckdb(sport: str, matchup: str, recommended_wager: float, kell
     try:
         # Pointing to the new directory we just made with mkdir
         conn = duckdb.connect('data/telemetry.duckdb')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS predictions_log (
+                sport VARCHAR, matchup VARCHAR, recommended_wager DOUBLE,
+                kelly_percentage DOUBLE, predicted_winner VARCHAR, vegas_line DOUBLE
+            )
+        ''')
         conn.execute('''
             INSERT INTO predictions_log (sport, matchup, recommended_wager, kelly_percentage, predicted_winner, vegas_line)
             VALUES (?, ?, ?, ?, ?, ?)

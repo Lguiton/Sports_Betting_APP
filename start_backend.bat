@@ -1,4 +1,4 @@
-ec@echo off
+@echo off
 cd /d "%~dp0"
 echo === NexFlow backend launcher ===
 

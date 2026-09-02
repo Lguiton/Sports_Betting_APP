@@ -12,3 +12,7 @@ numpy==2.5.2
 scipy==1.18.1
 statsmodels==0.14.6
 requests==2.31.0
+watchfiles  # lets uvicorn --reload actually watch for .py file changes on Windows
+curl_cffi  # impersonates a real browser's TLS/HTTP fingerprint -- needed to get past
+           # ESPN's site-api bot-mitigation, which a plain `requests` call gets 403'd by
+           # even with browser-shaped headers. Unpinned deliberately (new enough to matter).

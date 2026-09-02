@@ -1,5 +1,4 @@
 import requests
-import json
 
 url = "http://localhost:8000/chat/sports"
 payload = {
@@ -9,12 +8,12 @@ payload = {
     "risk_profile": "Moderate"
 }
 
-response = requests.post(url, json=payload)
-try:
-    data = response.json()
-    print("Response JSON:")
-    print(json.dumps(data, indent=2))
-except Exception as e:
-    print("Failed to parse JSON response:", e)
-    print("Raw response text:")
-    print(response.text)
+# NOTE: /chat/sports is a Server-Sent Events (SSE) stream, not a single JSON
+# response -- response.json() will fail against it. Read it line-by-line
+# like the frontend does instead.
+with requests.post(url, json=payload, stream=True) as response:
+    response.raise_for_status()
+    print(f"Status: {response.status_code}\n")
+    for line in response.iter_lines(decode_unicode=True):
+        if line:
+            print(line)
