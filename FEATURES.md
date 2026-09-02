@@ -506,3 +506,52 @@ bets -- and all 4 team names already match ESPN's canonical full form
 fragmentation exists yet in the real data, so no migration/cleanup was
 needed -- this fix prevents the problem going forward rather than
 patching existing drift.
+
+## User-reported bug: Monte Carlo (and projected score) always favored home,
+## regardless of real team strength -- confirmed and fixed
+
+**Symptom:** across three different real MLB matchups, the Monte Carlo
+panel favored the home team every time by roughly the same 57-59% margin,
+seemingly independent of each team's actual rating/standing.
+
+**Root cause, precisely quantified:** `run_monte_carlo_simulation` (and,
+to a lesser extent, `predict_matchup_winner`'s displayed projected score)
+in `sports_agent/tools.py` had a *second*, independent home-field bump
+hardcoded into the per-sport baseline scoring means (e.g. MLB: `mu_h=4.8`
+vs. `mu_a=4.2`) -- on top of the `edge` term already derived from
+`win_probability()`, which *itself* already adds a real home-field rating
+bonus (`home_adv`, e.g. +24 Glicko points for MLB). This double-counted
+home-field advantage, and worse: the fixed baseline gap ate a large,
+constant share (roughly a quarter to a third, depending on sport) of the
+`spread` budget the real `edge` needed to move the needle -- so even a
+substantial, well-established rating advantage for the *away* team could
+barely shift the simulated win rate off of "home favored."
+
+Quantified with the exact math before touching anything:
+- Two still-unrated MLB teams (a true 51.9% Glicko-implied toss-up, since
+  the only difference is home_adv) simulated as a **58.0%** home favorite.
+- An away team with a real, established +150-point rating advantage
+  (which Glicko puts at 39.8% for home, i.e. away clearly favored)
+  still simulated home at **51.1%** -- essentially erasing a real edge.
+- Even a massive +300-point away advantage (28.1% Glicko) only pulled the
+  simulated home number down to **44.0%** -- never actually showing home
+  as a real underdog.
+
+**Fix:** `mu_h`/`mu_a` (and `predict_matchup_winner`'s `base_h`/`base_a`)
+now start **equal** per sport -- home-field advantage flows exclusively
+through `edge`, which already reflects `win_probability()`'s real
+home_adv, each team's actual rating gap, rest days, and any situational
+adjustments (manual or the automatic ESPN injury sync). Re-verified the
+same three cases after the fix: the true-toss-up case now simulates at
+~51.2% (vs. Glicko's 51.9% -- within normal Monte Carlo noise), the
++150 away-advantage case now correctly shows the away team favored
+(44.0% home), and the +300 case shows home clearly as the underdog
+(37.3%, vs. Glicko's 28.1% -- some residual compression is expected and
+normal, since mapping a probability onto a fixed-shape score distribution
+via a single linear `edge * spread` term is an approximation, not exact
+inversion; it no longer masks the direction or rough scale of a real
+edge, which was the actual bug).
+
+This bug predates this session's changes (the baked-in home bump was
+already there) -- this session's earlier `int()`->`round()` fix only
+addressed the separate truncation-bias issue, not this one.

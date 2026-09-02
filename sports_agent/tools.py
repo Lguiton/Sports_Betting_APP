@@ -73,14 +73,18 @@ def predict_matchup_winner(home_team: str, away_team: str, sport: str = "NFL") -
     # being drawn completely independently of who the model favors.
     sport_upper = normalize_sport(sport)
     edge = home_prob - 0.5  # roughly -0.5 (huge underdog) .. +0.5 (huge favorite)
+    # base_h/base_a start EQUAL, same reasoning as run_monte_carlo_simulation
+    # above -- home-field advantage already lives in `edge` via
+    # win_probability_breakdown(), so a baked-in base_h > base_a here would
+    # double-count it in the displayed projected score.
     if sport_upper == "MLB":
-        base_h, base_a, spread = 4.5, 4.2, 3.0
+        base_h, base_a, spread = 4.35, 4.35, 3.0
     elif sport_upper == "NBA":
-        base_h, base_a, spread = 111.0, 109.0, 14.0
+        base_h, base_a, spread = 110.0, 110.0, 14.0
     elif sport_upper == "NCAAF":
-        base_h, base_a, spread = 28.0, 24.0, 15.0
+        base_h, base_a, spread = 26.0, 26.0, 15.0
     else:  # NFL
-        base_h, base_a, spread = 23.0, 21.0, 12.0
+        base_h, base_a, spread = 22.0, 22.0, 12.0
 
     home_score = round(max(0.0, base_h + edge * spread + random.uniform(-spread * 0.15, spread * 0.15)), 1)
     away_score = round(max(0.0, base_a - edge * spread + random.uniform(-spread * 0.15, spread * 0.15)), 1)
@@ -131,16 +135,27 @@ def run_monte_carlo_simulation(home_team: str, away_team: str, sport: str = "NFL
     home_prob = win_probability(sport, home_team, away_team)
     edge = home_prob - 0.5  # -0.5 (big underdog) .. +0.5 (big favorite)
 
-    # Dynamic Variance Settings (Mean, Standard Deviation)
+    # Dynamic Variance Settings (Mean, Standard Deviation). mu_h and mu_a
+    # start EQUAL -- home-field advantage must come from `edge` alone
+    # (win_probability() already adds a real home_adv rating bonus, plus
+    # each team's actual rating gap, rest days, and situational
+    # adjustments). An earlier version had mu_h hardcoded higher than
+    # mu_a here too, which double-counted home-field advantage on top of
+    # win_probability()'s own home_adv and, worse, ate a large fixed
+    # share of `spread`'s budget before `edge` ever got applied -- so even
+    # a real, well-established rating edge for the away team barely
+    # moved the simulated win rate off of "home favored." Confirmed live:
+    # two still-unrated MLB teams (a true 51.9% Glicko toss-up) were
+    # simulating as a 58% home favorite.
     sport_upper = normalize_sport(sport)
     if sport_upper == "MLB":
-        mu_h, sig_h, mu_a, sig_a, spread = 4.8, 2.5, 4.2, 2.2, 2.5
+        mu_h, sig_h, mu_a, sig_a, spread = 4.5, 2.5, 4.5, 2.2, 2.5
     elif sport_upper == "NBA":
-        mu_h, sig_h, mu_a, sig_a, spread = 112.5, 12.0, 108.5, 11.5, 16.0
+        mu_h, sig_h, mu_a, sig_a, spread = 110.5, 12.0, 110.5, 11.5, 16.0
     elif sport_upper == "NCAAF":
-        mu_h, sig_h, mu_a, sig_a, spread = 30.0, 10.5, 25.0, 9.5, 17.0
+        mu_h, sig_h, mu_a, sig_a, spread = 27.5, 10.5, 27.5, 9.5, 17.0
     else:  # Default NFL
-        mu_h, sig_h, mu_a, sig_a, spread = 24.5, 6.2, 21.5, 5.8, 10.0
+        mu_h, sig_h, mu_a, sig_a, spread = 23.0, 6.2, 23.0, 5.8, 10.0
 
     mu_h += edge * spread
     mu_a -= edge * spread
