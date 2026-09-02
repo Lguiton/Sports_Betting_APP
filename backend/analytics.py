@@ -223,6 +223,19 @@ def _game_already_logged(conn, sport: str, home_team: str, away_team: str, game_
     return row is not None
 
 
+def _fuzzy_team_match(a: str, b: str) -> bool:
+    """Loose team-name match (normalized substring in either direction),
+    e.g. so a bet logged as 'Red Sox' matches ESPN's full 'Boston Red Sox'
+    display name. An exact (or lower()) comparison is too strict here --
+    ESPN's scoreboard always uses full display names, but the Bet Journal's
+    own home/away fields are free text the user typed (its own placeholder
+    is the short form, e.g. 'Ravens')."""
+    a_norm, b_norm = espn_stats._normalize_name(a or ""), espn_stats._normalize_name(b or "")
+    if not a_norm or not b_norm:
+        return False
+    return a_norm in b_norm or b_norm in a_norm
+
+
 def run_auto_settlement_cycle() -> dict:
     """Checks today's ESPN scoreboard for every supported sport, and for
     any game that's gone Final: (1) logs the result into the Glicko-2
@@ -295,20 +308,38 @@ def run_auto_settlement_cycle() -> dict:
 
             conn = _connect()
             try:
+                # Pulled by sport only, not by an exact team-name match --
+                # see _fuzzy_team_match's docstring for why an exact
+                # comparison against ESPN's names would silently miss
+                # almost every bet logged with the app's own short-name
+                # convention.
                 pending = conn.execute(
                     """
-                    SELECT id, selection, odds, stake FROM bets
+                    SELECT id, selection, odds, stake, home_team, away_team FROM bets
                     WHERE status = 'pending' AND bet_type = 'moneyline'
-                      AND sport = ? AND lower(home_team) = lower(?) AND lower(away_team) = lower(?)
+                      AND sport = ? AND home_team IS NOT NULL AND away_team IS NOT NULL
                     """,
-                    [sport_norm, home_team, away_team],
+                    [sport_norm],
                 ).fetchall()
-                for bet_id, selection, odds, stake in pending:
+                for bet_id, selection, odds, stake, bet_home, bet_away in pending:
+                    if _fuzzy_team_match(bet_home, home_team) and _fuzzy_team_match(bet_away, away_team):
+                        winner_as_typed = bet_home if winner == home_team else bet_away
+                        loser_as_typed = bet_away if winner == home_team else bet_home
+                    elif _fuzzy_team_match(bet_home, away_team) and _fuzzy_team_match(bet_away, home_team):
+                        winner_as_typed = bet_away if winner == home_team else bet_home
+                        loser_as_typed = bet_home if winner == home_team else bet_away
+                    else:
+                        continue  # this bet isn't for this specific game
+
+                    # Match selection text against the bet's OWN team-name
+                    # text (whatever the user actually typed), not ESPN's
+                    # full display name -- the whole reason this can't just
+                    # reuse `winner`/`loser` for the text match too.
                     sel_lower = (selection or "").lower()
-                    if winner.lower() in sel_lower:
+                    if winner_as_typed.lower() in sel_lower:
                         new_status = "won"
                         profit = round(stake * (american_to_decimal(odds) - 1), 2)
-                    elif loser.lower() in sel_lower:
+                    elif loser_as_typed.lower() in sel_lower:
                         new_status = "lost"
                         profit = -stake
                     else:

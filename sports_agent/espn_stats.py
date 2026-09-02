@@ -59,6 +59,7 @@ SPORT_ESPN = {
 }
 
 _team_id_cache: dict = {}  # sport -> {lowercased name/alias: espn team id}
+_team_canonical_cache: dict = {}  # sport -> {espn team id: ESPN's own displayName}
 
 _CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 _TEAM_CACHE_FILE = os.path.join(_CACHE_DIR, "espn_team_cache.json")
@@ -306,6 +307,7 @@ def _team_id_map(sport: str) -> dict:
     entry = on_disk.get(sport_norm)
     if entry and (time.time() - entry.get("fetched_at", 0)) < _TEAM_CACHE_TTL_SECONDS:
         _team_id_cache[sport_norm] = entry["mapping"]
+        _team_canonical_cache[sport_norm] = entry.get("canonical", {})
         return entry["mapping"]
 
     cfg = _espn_cfg(sport_norm)
@@ -317,11 +319,13 @@ def _team_id_map(sport: str) -> dict:
         # Team ids essentially never change, so even a week-old map is fine.
         if entry:
             _team_id_cache[sport_norm] = entry["mapping"]
+            _team_canonical_cache[sport_norm] = entry.get("canonical", {})
             return entry["mapping"]
         raise
 
     teams = (((data.get("sports") or [{}])[0].get("leagues") or [{}])[0].get("teams")) or []
     mapping: dict = {}
+    canonical: dict = {}  # espn team id -> ESPN's own displayName
     for t in teams:
         team = t.get("team", {})
         team_id = team.get("id")
@@ -331,11 +335,40 @@ def _team_id_map(sport: str) -> dict:
             val = team.get(key)
             if val:
                 mapping.setdefault(val.lower(), team_id)
+        if team.get("displayName"):
+            canonical[team_id] = team["displayName"]
     _team_id_cache[sport_norm] = mapping
+    _team_canonical_cache[sport_norm] = canonical
 
-    on_disk[sport_norm] = {"mapping": mapping, "fetched_at": time.time()}
+    on_disk[sport_norm] = {"mapping": mapping, "canonical": canonical, "fetched_at": time.time()}
     _save_team_cache(on_disk)
     return mapping
+
+
+def canonical_team_name(sport: str, team_name: str):
+    """Resolves any known alias/short name for a team (e.g. 'Red Sox',
+    'BOS', 'Boston') to ESPN's own full displayName ('Boston Red Sox').
+
+    Every part of the app that keys data by team name -- ratings,
+    situational adjustments, rest-day tracking, logged game results --
+    should canonicalize through this first. Without it, a team's whole
+    history can silently fragment across whichever string form happened to
+    get used each time (a chat query typed 'Braves', auto-settlement's
+    ESPN scoreboard name 'Atlanta Braves', a manually-logged result typed
+    yet another way) -- each landing on a different `team_ratings` row
+    that starts over at the default rating, with predictions and the
+    auto-settled results never actually talking to each other.
+
+    Returns None (never raises) if the team can't be resolved -- callers
+    should fall back to the original string rather than fail outright."""
+    try:
+        team_id = _resolve_team_id(sport, team_name)
+        if not team_id:
+            return None
+        _team_id_map(sport)  # ensures _team_canonical_cache is populated for this sport
+        return _team_canonical_cache.get(normalize_sport(sport), {}).get(team_id)
+    except Exception:
+        return None
 
 
 def _resolve_team_id(sport: str, team_name: str):

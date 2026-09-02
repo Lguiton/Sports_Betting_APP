@@ -431,3 +431,78 @@ session): whether `get_team_injuries`'s URL/shape assumption is actually
 right. If `GET /espn/injuries` comes back empty for a team with known
 injuries, paste `GET /espn/debug/injuries-raw?sport=...&team=...`'s
 output back and it'll get fixed the same way player-stats did.
+
+## Post-deploy audit: two real bugs found and fixed in the enhancement round
+
+Ran a deliberate audit of everything from the previous round (auto-
+settlement, injury sync, steam alerts) rather than trusting the earlier
+offline tests alone. Found two genuine defects, both fixed and re-verified
+before this note was written.
+
+### Bug 1: auto-settlement's bet matching used an exact string comparison
+
+`run_auto_settlement_cycle` matched pending bets to a finished ESPN game
+with `lower(bets.home_team) = lower(espn_home_team)`. ESPN's scoreboard
+always returns full display names ("Boston Red Sox"), but the Bet
+Journal's own home/away fields are free text the user types -- and the
+form's own placeholder ("Ravens") models the *short* form. In practice
+this meant almost no moneyline bet would ever actually get matched to its
+game, let alone graded -- the exact-match condition would almost always
+be false. Same problem existed a second time in the selection-text match
+(`winner.lower() in selection`), for the same reason.
+
+Fixed by pulling pending bets by sport only, then fuzzy-matching each
+bet's own home/away text against the ESPN game's team names in either
+orientation (`_fuzzy_team_match`, normalized substring match, reusing
+`espn_stats._normalize_name`), and matching selection text against the
+bet's *own* team-name text rather than ESPN's. Re-verified against the
+real short-vs-full-name scenario (`"Red Sox"` bet vs. ESPN's `"Boston Red
+Sox"`), a swapped-orientation bet, a genuine loss, and an unrelated
+matchup that must NOT match -- all correct.
+
+### Bug 2 (more significant): team names weren't canonicalized anywhere,
+### so ratings/situational-adjustment history could silently fragment
+
+`team_ratings` and `team_status` are both keyed by an exact `team` string
+-- `WHERE sport = ? AND team = ?`, no fuzzy matching. Before this fix,
+that string was whatever happened to be passed in: a chat prediction
+might use `"Braves"`, while the new auto-settlement cycle always uses
+ESPN's own full scoreboard name (`"Atlanta Braves"`). Those would land on
+*two different rows*, each starting over at the default 1500 rating --
+meaning auto-settlement could keep logging real results that a
+short-name chat prediction would never actually see, silently defeating
+the entire point of closing the loop. The same fragmentation risk applied
+to situational adjustments (manual notes vs. the new ESPN injury sync)
+and rest-day tracking.
+
+Fixed with `espn_stats.canonical_team_name(sport, name)` (resolves any
+known alias to ESPN's own full display name, reusing the already-cached
+team-id map -- no extra network calls) and a `ratings._canonicalize()`
+wrapper used in two layers for defense in depth: at the entry points
+(`win_probability`, `win_probability_breakdown`, `record_game_result`,
+`set_team_status`, `replace_auto_team_status`) *and* inside the low-level
+read primitives themselves (`get_rating_full`, `get_active_status_
+adjustment`, `_rest_days`), so a future direct caller can't bypass it by
+accident. Falls back to the original string (never raises) if ESPN can't
+resolve a name, so a lookup failure degrades to the old behavior instead
+of breaking anything.
+
+Verified end-to-end against a real scratch DuckDB (not mocked): confirmed
+import order between `ratings.py` and `espn_stats.py` doesn't create a
+circular-import failure either direction (they reference each other, so
+the resolution uses a lazy import); confirmed a chat-style prediction
+using the short name (`"Red Sox"`) sees a result the auto-settlement
+cycle logged using ESPN's full name (`"Boston Red Sox"`) -- including the
+win probability actually moving after the result, the situational
+adjustment sync being visible via the short name, and rest-days tracking
+correctly across the name-form boundary; re-ran the earlier manual-vs-
+auto isolation tests to confirm this didn't regress them.
+
+**Checked the user's actual live data before writing this off as
+theoretical**: as of this audit, `data/telemetry.duckdb` has 4
+`team_ratings` rows, 2 `game_results`, 0 `team_status` entries, and 0
+bets -- and all 4 team names already match ESPN's canonical full form
+(auto-settlement had already run live and logged them correctly). No
+fragmentation exists yet in the real data, so no migration/cleanup was
+needed -- this fix prevents the problem going forward rather than
+patching existing drift.

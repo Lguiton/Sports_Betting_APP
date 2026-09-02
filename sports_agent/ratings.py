@@ -287,6 +287,7 @@ def get_rating(sport: str, team: str, conn=None) -> float:
 
 def get_rating_full(sport: str, team: str, conn=None) -> dict:
     sport = normalize_sport(sport)
+    team = _canonicalize(sport, team)
     owns_conn = conn is None
     conn = conn or _connect()
     try:
@@ -327,6 +328,7 @@ def get_active_status_adjustment(sport: str, team: str, conn=None) -> dict:
     """Sum of active (non-expired) manual situational adjustments for a
     team, clamped to a sane range, plus the notes behind them."""
     sport = normalize_sport(sport)
+    team = _canonicalize(sport, team)
     owns_conn = conn is None
     conn = conn or _connect()
     try:
@@ -349,6 +351,7 @@ def get_active_status_adjustment(sport: str, team: str, conn=None) -> dict:
 def set_team_status(sport: str, team: str, adjustment: float, note: Optional[str] = None,
                      expires_at: Optional[str] = None, source: str = "manual") -> dict:
     sport = normalize_sport(sport)
+    team = _canonicalize(sport, team)
     adjustment = max(-STATUS_ADJUSTMENT_CAP, min(STATUS_ADJUSTMENT_CAP, adjustment))
     conn = _connect()
     try:
@@ -373,6 +376,7 @@ def replace_auto_team_status(sport: str, team: str, adjustment: float, note: Opt
     (manual entries you typed in yourself default to 'manual') are never
     touched."""
     sport = normalize_sport(sport)
+    team = _canonicalize(sport, team)
     adjustment = max(-STATUS_ADJUSTMENT_CAP, min(STATUS_ADJUSTMENT_CAP, adjustment))
     conn = _connect()
     try:
@@ -427,9 +431,11 @@ def clear_team_status(status_id: int) -> bool:
 
 
 def _rest_days(sport: str, team: str, as_of: Optional[str], conn) -> Optional[int]:
+    sport = normalize_sport(sport)
+    team = _canonicalize(sport, team)
     row = conn.execute(
         "SELECT last_game_date FROM team_ratings WHERE sport = ? AND team = ?",
-        [normalize_sport(sport), team],
+        [sport, team],
     ).fetchone()
     if not row or not row[0]:
         return None
@@ -440,10 +446,34 @@ def _rest_days(sport: str, team: str, as_of: Optional[str], conn) -> Optional[in
     return max(0, (target - last_game).days)
 
 
+def _canonicalize(sport: str, team: str) -> str:
+    """Best-effort resolve to ESPN's canonical team display name, so every
+    part of the app converges on the same team_ratings/team_status key
+    regardless of which string form was used to call in (a chat query's
+    'Braves', auto-settlement's ESPN scoreboard 'Atlanta Braves', a
+    manually-logged result typed a third way). Without this, those would
+    each land on a different team_ratings row starting at the default
+    rating, silently disconnecting predictions from logged results.
+
+    Falls back to the original string (never raises) if ESPN can't
+    resolve it -- offline, or a name this sport's ESPN mapping doesn't
+    have -- so a lookup failure here degrades to the pre-fix behavior
+    instead of breaking the caller."""
+    if not team:
+        return team
+    try:
+        from sports_agent import espn_stats  # lazy: espn_stats imports normalize_sport from this module
+        return espn_stats.canonical_team_name(sport, team) or team
+    except Exception:
+        return team
+
+
 def win_probability(sport: str, home_team: str, away_team: str, game_date: Optional[str] = None) -> float:
     """Glicko-2-implied probability the HOME team wins, in [0, 1] -- folds
     in home-field advantage, each team's rating uncertainty, logged rest
     days, and any active manual situational adjustments."""
+    home_team = _canonicalize(sport, home_team)
+    away_team = _canonicalize(sport, away_team)
     params = _sport_params(sport)
     conn = _connect()
     try:
@@ -476,6 +506,8 @@ def win_probability_breakdown(sport: str, home_team: str, away_team: str,
                                game_date: Optional[str] = None) -> dict:
     """Same math as win_probability(), but returns every ingredient so the
     UI can show *why* a pick was favored instead of a black-box number."""
+    home_team = _canonicalize(sport, home_team)
+    away_team = _canonicalize(sport, away_team)
     params = _sport_params(sport)
     conn = _connect()
     try:
@@ -546,6 +578,8 @@ def record_game_result(
         raise ValueError("Rating update needs a decisive result -- no ties supported.")
 
     sport = normalize_sport(sport)
+    home_team = _canonicalize(sport, home_team)
+    away_team = _canonicalize(sport, away_team)
     params = _sport_params(sport)
     game_date = game_date or date.today().isoformat()
     conn = _connect()
