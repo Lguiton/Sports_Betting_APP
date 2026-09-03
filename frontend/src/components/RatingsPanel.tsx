@@ -227,7 +227,12 @@ export default function RatingsPanel() {
                     </span>
                     {s.source === "espn_auto" && (
                       <span className="text-[9px] text-slate-500 border border-[#1C212B] rounded px-1 py-[1px] ml-1 uppercase">
-                        Auto -- ESPN
+                        Auto -- ESPN Injury
+                      </span>
+                    )}
+                    {s.source === "espn_stats_auto" && (
+                      <span className="text-[9px] text-slate-500 border border-[#1C212B] rounded px-1 py-[1px] ml-1 uppercase">
+                        Auto -- ESPN Stats
                       </span>
                     )}
                     {s.note && <span className="text-slate-500"> -- {s.note}</span>}

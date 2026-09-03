@@ -6,7 +6,7 @@ performance stats, multi-book odds comparison, and arbitrage scanning.
 This is a single-user, no-auth app meant to run locally for one person --
 there is no tenant/account model here on purpose.
 """
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional, Literal
 
 import duckdb
@@ -263,12 +263,29 @@ def run_auto_settlement_cycle() -> dict:
     games_logged = 0
     bets_graded = 0
 
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
     for sport in ODDS_SPORT_KEYS:
-        try:
-            board = espn_stats.get_scoreboard(sport)
-        except Exception:
-            continue
-        games = board.get("games") if isinstance(board, dict) else None
+        # Checks today's AND yesterday's ESPN scoreboard, not just
+        # "today" -- a game that went Final late last night (or any day
+        # this app happened not to be running) would otherwise never get
+        # logged, since ESPN's scoreboard endpoint only returns the one
+        # date you ask for. _game_already_logged's dedup check means
+        # re-checking yesterday on every cycle is harmless.
+        games = []
+        seen_event_ids = set()
+        for check_date in (today, yesterday):
+            try:
+                board = espn_stats.get_scoreboard(sport, check_date)
+            except Exception:
+                continue
+            for g in (board.get("games") if isinstance(board, dict) else None) or []:
+                event_id = g.get("espn_event_id")
+                if event_id and event_id in seen_event_ids:
+                    continue
+                if event_id:
+                    seen_event_ids.add(event_id)
+                games.append(g)
         if not games:
             continue
 
@@ -820,6 +837,150 @@ def trigger_injury_sync():
     """Run one injury-sync pass right now instead of waiting for the next
     scheduled poll."""
     return run_injury_sync_cycle()
+
+
+# ---------------------------------------------------------------------------
+# Automatic stats sync: folds each team's real season point/run
+# differential -- straight from ESPN's official standings, not derived
+# from anything logged in this app -- into the same situational
+# adjustment system as injuries above. This is what lets the model react
+# to how a team is actually outscoring opponents *this season*, instead
+# of relying only on the thin history this app's own Glicko ratings have
+# built up from games logged here.
+# ---------------------------------------------------------------------------
+
+STATS_SYNC_INTERVAL_MINUTES = 180  # standings move slowly game-to-game -- no need to poll as often as injuries
+
+# Converts a team's real season point/run differential-per-game into a
+# rating-point nudge. Scaled per sport since "differential" means very
+# different things across leagues (MLB run differential per game is
+# typically single digits; NBA/NFL/NCAAF point differentials run much
+# higher) -- calibrated so a genuinely dominant team's edge can rival,
+# but not swamp, that sport's own home_adv in ratings.py, then hard-capped
+# per sport. get_active_status_adjustment() also caps the *combined*
+# total of this + injuries + any manual entry at STATUS_ADJUSTMENT_CAP, so
+# nothing here can run away on its own even if these numbers are off.
+# Treat this as a tuned heuristic, not a validated statistical model --
+# there's no historical backtest behind these exact constants yet.
+_STATS_DIFF_SCALE = {"NFL": 3.0, "NBA": 3.0, "MLB": 9.0, "NCAAF": 2.5}
+_STATS_ADJUSTMENT_CAP_PER_SPORT = {"NFL": 60.0, "NBA": 60.0, "MLB": 45.0, "NCAAF": 60.0}
+
+
+def _num(v):
+    """Best-effort float parse of whatever ESPN handed back for a stat
+    field -- can already be a real number, a numeric string, a signed
+    string like '+12', or missing entirely."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        try:
+            return float(str(v).replace("+", "").strip())
+        except (TypeError, ValueError):
+            return None
+
+
+def run_stats_sync_cycle() -> dict:
+    """Pulls each supported sport's real ESPN standings and converts
+    every team's season point/run differential into an automatic
+    situational adjustment via ratings.replace_auto_team_status (source
+    'espn_stats_auto') -- separate from, and additive with, the injury
+    sync's 'espn_auto' adjustments above. Re-running this clears and
+    re-derives every 'espn_stats_auto' adjustment each time, same pattern
+    as injury sync, so it always reflects the current standings instead
+    of piling up stale entries."""
+    conn = _connect()
+    try:
+        enabled = _get_setting(conn, "stats_sync_enabled", "true") == "true"
+    finally:
+        conn.close()
+    if not enabled:
+        return {"ran": False, "reason": "stats sync is disabled"}
+
+    teams_synced = 0
+    for sport in ODDS_SPORT_KEYS:
+        try:
+            board = espn_stats.get_standings(sport)
+        except Exception:
+            continue
+        rows = board.get("standings") if isinstance(board, dict) else None
+        if not rows:
+            continue
+
+        scale = _STATS_DIFF_SCALE.get(sport, 3.0)
+        cap = _STATS_ADJUSTMENT_CAP_PER_SPORT.get(sport, 50.0)
+
+        for row in rows:
+            team = row.get("team")
+            if not team:
+                continue
+
+            wins, losses = _num(row.get("wins")), _num(row.get("losses"))
+            games_played = (wins or 0.0) + (losses or 0.0) if (wins is not None or losses is not None) else None
+            if not games_played:
+                continue  # no games played yet this season (or ESPN didn't report a record) -- nothing to derive
+
+            points_for, points_against = _num(row.get("points_for")), _num(row.get("points_against"))
+            if points_for is not None and points_against is not None:
+                per_game_diff = (points_for - points_against) / games_played
+            else:
+                season_diff = _num(row.get("point_differential"))
+                if season_diff is None:
+                    continue
+                per_game_diff = season_diff / games_played
+
+            adjustment = max(-cap, min(cap, per_game_diff * scale))
+            wins_disp = int(wins) if wins is not None else "?"
+            losses_disp = int(losses) if losses is not None else "?"
+            note = f"Auto (ESPN standings): {wins_disp}-{losses_disp}, {per_game_diff:+.1f} diff/g"
+
+            try:
+                replace_auto_team_status(sport, team, adjustment, note, expires_at=None, source="espn_stats_auto")
+                teams_synced += 1
+            except Exception:
+                continue
+
+    conn = _connect()
+    try:
+        _set_setting(conn, "stats_sync_last_run", datetime.now().isoformat())
+    finally:
+        conn.close()
+    return {"ran": True, "teams_synced": teams_synced}
+
+
+class StatsSyncToggle(BaseModel):
+    enabled: bool
+
+
+@router.post("/stats-sync/enabled")
+def set_stats_sync(payload: StatsSyncToggle):
+    conn = _connect()
+    try:
+        _set_setting(conn, "stats_sync_enabled", "true" if payload.enabled else "false")
+    finally:
+        conn.close()
+    return {"stats_sync_enabled": payload.enabled}
+
+
+@router.get("/stats-sync/status")
+def get_stats_sync_status():
+    conn = _connect()
+    try:
+        enabled = _get_setting(conn, "stats_sync_enabled", "true") == "true"
+        last_run = _get_setting(conn, "stats_sync_last_run", "")
+    finally:
+        conn.close()
+    return {"stats_sync_enabled": enabled, "last_run": last_run or None,
+            "poll_interval_minutes": STATS_SYNC_INTERVAL_MINUTES}
+
+
+@router.post("/stats-sync/run")
+def trigger_stats_sync():
+    """Run one stats-sync pass right now instead of waiting for the next
+    scheduled poll."""
+    return run_stats_sync_cycle()
+
 
 
 # ---------------------------------------------------------------------------

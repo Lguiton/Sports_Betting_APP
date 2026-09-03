@@ -15,6 +15,7 @@ from backend.analytics import (
     run_line_tracking_cycle, LINE_TRACKING_INTERVAL_MINUTES,
     run_auto_settlement_cycle, AUTO_SETTLE_INTERVAL_MINUTES,
     run_injury_sync_cycle, INJURY_SYNC_INTERVAL_MINUTES,
+    run_stats_sync_cycle, STATS_SYNC_INTERVAL_MINUTES,
 )
 
 
@@ -55,12 +56,26 @@ async def _injury_sync_loop():
         await asyncio.sleep(INJURY_SYNC_INTERVAL_MINUTES * 60)
 
 
+async def _stats_sync_loop():
+    """Background poller that turns ESPN's real season standings
+    (point/run differential) into automatic situational rating
+    adjustments. Defaults ON -- see POST /stats-sync/enabled in
+    backend/analytics.py to turn it off."""
+    while True:
+        try:
+            await asyncio.to_thread(run_stats_sync_cycle)
+        except Exception:
+            traceback.print_exc()
+        await asyncio.sleep(STATS_SYNC_INTERVAL_MINUTES * 60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(_line_tracking_loop()),
         asyncio.create_task(_auto_settle_loop()),
         asyncio.create_task(_injury_sync_loop()),
+        asyncio.create_task(_stats_sync_loop()),
     ]
     try:
         yield

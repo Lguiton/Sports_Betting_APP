@@ -555,3 +555,103 @@ edge, which was the actual bug).
 This bug predates this session's changes (the baked-in home bump was
 already there) -- this session's earlier `int()`->`round()` fix only
 addressed the separate truncation-bias issue, not this one.
+
+## New: log every completed game regardless of bets (mostly already true --
+## and hardened), plus a real ESPN-standings-driven stats feed into
+## predictions
+
+**What was asked:** log every final score so the rating engine accumulates
+data across all games, not just ones with a bet on them, and fold real team
+stats into the model so predictions aren't relying on win/loss history alone.
+
+**Part 1 -- auditing "log all scores regardless of bets" against the real
+code and the real live data before changing anything:** `run_auto_settlement_cycle`
+already logs *every* completed game it finds on ESPN's scoreboard into
+`record_game_result` unconditionally -- the bet-matching/grading step that
+follows is a completely separate loop over `bets`, gated only by whether a
+pending bet happens to match that specific game. Confirmed this directly
+against the live database rather than trusting the docstring: as of this
+session, `bets` has **0** rows, yet `game_results` has **7** logged games
+(Red Sox/Mariners, Rockies/Orioles, Diamondbacks/Phillies, Rangers/Athletics,
+Nationals/Braves, Reds/Padres, USC/San Jose State) -- every one of them with
+no bet attached. So this part of the request was already true before this
+session's change; what was missing was robustness, not scope:
+
+- **Fixed:** the cycle only ever checked *today's* ESPN scoreboard. A game
+  that went Final overnight, or on a day the app simply wasn't running,
+  would never get logged -- ESPN's scoreboard endpoint only returns the one
+  date you ask it for, and there was no backfill. `run_auto_settlement_cycle`
+  now checks both today's and yesterday's scoreboard every cycle (deduped by
+  `espn_event_id` so a game appearing on both days' boards isn't processed
+  twice; `_game_already_logged`'s existing check still prevents a
+  double-write to `game_results` either way).
+
+**Part 2 -- real team stats now feed into predictions, not just game-logged
+win/loss history:** added a new automatic sync cycle, `run_stats_sync_cycle`
+(`backend/analytics.py`), that pulls each sport's real, official ESPN
+standings (`espn_stats.get_standings` -- an already-shipped, structured
+endpoint, not the free-form/unverified-shape `get_team_stats`) and turns
+each team's season point/run differential into a rating-point nudge via the
+same `team_status` mechanism the ESPN injury sync already uses, under its
+own `source='espn_stats_auto'` tag so it's additive with (not a replacement
+for) injury adjustments and anything entered manually -- all three sum
+together and the combined total is still hard-capped by the existing
+`STATUS_ADJUSTMENT_CAP`.
+
+This is genuinely new signal, not a restatement of the Glicko rating: the
+Glicko rating only moves from games *this app* has logged (currently a
+handful per team), while ESPN's standings reflect the team's entire real
+season to date. A team that's outscoring opponents by a full run/game in
+MLB, or double digits per game in NBA/NFL/NCAAF, now visibly nudges that
+team's win probability even before this app's own logged-game history has
+caught up.
+
+Scaling (points-differential-per-game -> rating points, then hard-capped
+per sport) is a documented, tunable heuristic calibrated to roughly rival
+-- not swamp -- that sport's own home-field advantage constant, same
+spirit as the injury-sync weights: NFL/NBA `x3.0` (cap 60), MLB `x9.0`
+(cap 45, since MLB run differentials are naturally much smaller numbers),
+NCAAF `x2.5` (cap 60, college football differentials run larger). There is
+no historical backtest behind these exact constants -- they're a
+reasonable first pass, not a fitted model, and worth revisiting once more
+real results have accumulated. Re-running the sync clears and re-derives
+every `espn_stats_auto` row each time (same pattern as injury sync), so a
+team's early-season stats don't linger stale once the season moves on.
+
+Runs automatically every 3 hours (`STATS_SYNC_INTERVAL_MINUTES = 180` --
+standings move far slower than injury reports, hence the longer interval
+than the 60-minute injury sync), on by default, with the same
+enabled/status/manual-trigger endpoint trio as the other auto-cycles:
+`POST /stats-sync/enabled`, `GET /stats-sync/status`, `POST /stats-sync/run`.
+The Ratings panel's situational-adjustment list now tags entries from this
+source "Auto -- ESPN Stats" (renamed the existing injury tag to "Auto --
+ESPN Injury" alongside it, so the two auto-sources are distinguishable at a
+glance instead of both saying "Auto -- ESPN").
+
+**Verified before committing:**
+- Ran the exact `_num()` / differential-derivation logic standalone against
+  synthetic ESPN-standings-shaped rows covering: a normal team via
+  `points_for`/`points_against`, a team where only the season
+  `point_differential` field is present, a blowout-level differential that
+  should hit the per-sport cap, string-typed win/loss and signed-string
+  differential fields (`"10"`, `"-84"`), a team with 0 games played (must
+  be skipped, not divide-by-zero), a row missing `wins`/`losses` entirely
+  (must be skipped), and a specific falsy-zero edge case -- 0 wins, 1 loss
+  -- that must still be treated as 1 game played rather than incorrectly
+  skipped. All passed.
+- Ran the real `ratings.py` (unmodified) against a scratch copy of the
+  actual live database: applied a stats-derived adjustment to a real
+  matchup (Red Sox home vs. Mariners away) and confirmed
+  `win_probability` moved from 37.8% to 41.0% home in the correct
+  direction; confirmed re-running the sync for the same team replaces
+  (doesn't duplicate) its `espn_stats_auto` row; and confirmed a stats
+  adjustment, an injury adjustment, and a manual entry for the same team
+  all coexist and sum correctly (25 + -6 + 5 = 24 -> 29 pts across the
+  three sources in sequence) rather than one clobbering another.
+- Could not live-verify the exact JSON shape ESPN's standings endpoint
+  returns today, since this session's bridge to the user's machine has no
+  outbound network path to ESPN (or to the app's own localhost) to test
+  against -- `espn_stats.get_standings` itself is pre-existing,
+  already-shipped code (already backing the live `/espn/standings`
+  endpoint before this session), not new/unverified parsing, which is why
+  it was used here instead of the flagged-as-unverified `get_team_stats`.
