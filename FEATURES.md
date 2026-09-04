@@ -695,3 +695,57 @@ misbehave at the boundary: the same record hypothetically at 8 games
 played reaches full (uncapped-by-confidence) weight, and at 16 games
 (2x the threshold) it correctly stays at 1.0x rather than amplifying
 further.
+
+## New: manual "Sync ESPN Data Now" button (plus a real concurrency fix it
+## surfaced)
+
+**What was asked:** a way to trigger the ESPN pulls by hand instead of only
+waiting on their automatic timers.
+
+**What was built:** one button in the Ratings panel's "Power Rankings"
+header, "Sync ESPN Data Now", that calls a new `POST /espn-sync/run-all`
+endpoint. It runs all three ESPN-driven cycles back to back in one request
+-- auto-settlement (game logging + bet grading), injury sync, and stats
+sync -- and reports a one-line summary (games logged, bets graded, teams
+injury-synced, teams stats-synced) plus immediately refreshes the visible
+ratings/situational-adjustment lists. Each cycle still respects its own
+enabled/disabled toggle, same as triggering it individually.
+
+**A real bug this surfaced before it shipped:** testing the button by
+actually firing it -- not just reading the code -- reproduced a genuine
+DuckDB `TransactionException: Conflict on update!` the very first time it
+overlapped with one of the automatic background loops (every loop fires
+once immediately on startup, and the button can easily land in that same
+window). Every cycle opens and closes its own database connection
+independently, and DuckDB does not tolerate two connections writing to the
+same file at the same instant -- this app runs up to four such cycles
+(line tracking, auto-settlement, injury sync, stats sync) as independent
+background loops in the same process, and now also a manual trigger that
+can overlap any of them.
+
+**Fix:** added a single process-wide lock (`_CYCLE_LOCK` / `_run_locked`
+in `backend/analytics.py`) that every entry point into one of these
+cycles now goes through -- all four background loops (`backend/main.py`)
+and every manual `/…/run` endpoint (including the new combined one).
+Only one cycle can touch the database at a time, whichever fired first,
+regardless of whether it was scheduled or triggered by hand. Re-ran the
+same overlap scenario afterward and the `TransactionException` did not
+recur.
+
+**Verification, and its limits:** confirmed a clean Python import of both
+`backend.main` and `backend.analytics` with all changes applied, a clean
+project-wide `tsc --noEmit` pass for the frontend change, and multiple
+live runs of the actual FastAPI app (uvicorn) against a real copy of the
+live database, including deliberately overlapping the new endpoint with
+the background loops' own startup-time first run -- which is what caught
+the concurrency bug above and confirmed the fix stopped it recurring.
+Later verification passes in this same session hit an unrelated
+environment issue: this cloud sandbox's bridge to the user's machine
+intermittently could not reach the test server it had just confirmed was
+listening, and separately needed a delete-permission grant re-issued
+after a brief bridge disconnect before DuckDB's own WAL-file cleanup could
+proceed -- both traced to the sandbox/bridge layer itself (confirmed with
+an isolated, unrelated `os.remove()` test) rather than to this code, but
+they mean the very last few end-to-end runs are not as clean a signal as
+the earlier ones. The button should be tested live once on the real
+dashboard before being trusted for anything time-sensitive.

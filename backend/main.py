@@ -16,6 +16,7 @@ from backend.analytics import (
     run_auto_settlement_cycle, AUTO_SETTLE_INTERVAL_MINUTES,
     run_injury_sync_cycle, INJURY_SYNC_INTERVAL_MINUTES,
     run_stats_sync_cycle, STATS_SYNC_INTERVAL_MINUTES,
+    _run_locked,
 )
 
 
@@ -26,7 +27,7 @@ async def _line_tracking_loop():
     who never opts in -- see backend/analytics.py for why it defaults off."""
     while True:
         try:
-            await asyncio.to_thread(run_line_tracking_cycle)
+            await asyncio.to_thread(_run_locked, run_line_tracking_cycle)
         except Exception:
             traceback.print_exc()
         await asyncio.sleep(LINE_TRACKING_INTERVAL_MINUTES * 60)
@@ -38,7 +39,7 @@ async def _auto_settle_loop():
     POST /auto-settle/enabled in backend/analytics.py to turn it off."""
     while True:
         try:
-            await asyncio.to_thread(run_auto_settlement_cycle)
+            await asyncio.to_thread(_run_locked, run_auto_settlement_cycle)
         except Exception:
             traceback.print_exc()
         await asyncio.sleep(AUTO_SETTLE_INTERVAL_MINUTES * 60)
@@ -50,7 +51,7 @@ async def _injury_sync_loop():
     POST /injury-sync/enabled in backend/analytics.py to turn it off."""
     while True:
         try:
-            await asyncio.to_thread(run_injury_sync_cycle)
+            await asyncio.to_thread(_run_locked, run_injury_sync_cycle)
         except Exception:
             traceback.print_exc()
         await asyncio.sleep(INJURY_SYNC_INTERVAL_MINUTES * 60)
@@ -63,7 +64,7 @@ async def _stats_sync_loop():
     backend/analytics.py to turn it off."""
     while True:
         try:
-            await asyncio.to_thread(run_stats_sync_cycle)
+            await asyncio.to_thread(_run_locked, run_stats_sync_cycle)
         except Exception:
             traceback.print_exc()
         await asyncio.sleep(STATS_SYNC_INTERVAL_MINUTES * 60)

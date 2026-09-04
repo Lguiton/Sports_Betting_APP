@@ -11,6 +11,7 @@ from typing import Optional, Literal
 
 import duckdb
 import requests
+import threading
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -32,6 +33,24 @@ ODDS_SPORT_KEYS = {
     "MLB": "baseball_mlb",
     "NCAAF": "americanfootball_ncaaf",
 }
+
+# DuckDB doesn't tolerate two connections writing to the same file at the
+# same instant -- confirmed live: running two of this app's background
+# cycles concurrently (a scheduled poll firing at the same moment as a
+# manual "run now" trigger) threw a real TransactionException/IOException
+# on the database's WAL file, not just a theoretical race. This app runs
+# up to four such cycles (line tracking, auto-settlement, injury sync,
+# stats sync) as independent background loops in the same process, plus
+# manual "run now" triggers for several of them -- so every entry point
+# that runs one of these cycles goes through this single process-wide
+# lock, guaranteeing only one cycle ever touches the database at a time
+# regardless of whether it fired automatically or by hand.
+_CYCLE_LOCK = threading.Lock()
+
+
+def _run_locked(fn, *args, **kwargs):
+    with _CYCLE_LOCK:
+        return fn(*args, **kwargs)
 
 
 def _connect():
@@ -413,7 +432,7 @@ def get_auto_settle_status():
 def trigger_auto_settle():
     """Run one auto-settlement pass right now instead of waiting for the
     next scheduled poll -- handy for testing or right after a game ends."""
-    return run_auto_settlement_cycle()
+    return _run_locked(run_auto_settlement_cycle)
 
 
 # ---------------------------------------------------------------------------
@@ -836,7 +855,7 @@ def get_injury_sync_status():
 def trigger_injury_sync():
     """Run one injury-sync pass right now instead of waiting for the next
     scheduled poll."""
-    return run_injury_sync_cycle()
+    return _run_locked(run_injury_sync_cycle)
 
 
 # ---------------------------------------------------------------------------
@@ -997,7 +1016,23 @@ def get_stats_sync_status():
 def trigger_stats_sync():
     """Run one stats-sync pass right now instead of waiting for the next
     scheduled poll."""
-    return run_stats_sync_cycle()
+    return _run_locked(run_stats_sync_cycle)
+
+
+@router.post("/espn-sync/run-all")
+def trigger_espn_sync_all():
+    """Manually runs all three ESPN-driven background cycles right now
+    -- auto-settlement (game logging + bet grading), injury sync, and
+    stats sync -- instead of waiting on their separate timers (20/60/180
+    minutes). One click refreshes the whole rating picture. Each cycle
+    still respects its own enabled/disabled toggle, same as triggering
+    it individually via its own /run endpoint."""
+    return {
+        "ran_at": datetime.now().isoformat(),
+        "auto_settlement": _run_locked(run_auto_settlement_cycle),
+        "injury_sync": _run_locked(run_injury_sync_cycle),
+        "stats_sync": _run_locked(run_stats_sync_cycle),
+    }
 
 
 

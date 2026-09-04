@@ -27,6 +27,9 @@ export default function RatingsPanel() {
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncResult, setSyncResult] = useState<string | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   const refresh = useCallback(async (s: string) => {
     try {
@@ -45,6 +48,33 @@ export default function RatingsPanel() {
       console.error("Failed to load team status:", err);
     }
   }, []);
+
+  const runEspnSyncNow = useCallback(async () => {
+    setSyncing(true);
+    setSyncError(null);
+    setSyncResult(null);
+    try {
+      const res = await fetch(`${backendUrl()}/espn-sync/run-all`, { method: "POST" });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || "ESPN sync failed");
+      }
+      const data = await res.json();
+      const gamesLogged = data.auto_settlement?.games_logged ?? 0;
+      const betsGraded = data.auto_settlement?.bets_graded ?? 0;
+      const injuryTeams = data.injury_sync?.teams_synced ?? 0;
+      const statsTeams = data.stats_sync?.teams_synced ?? 0;
+      setSyncResult(
+        `Games logged: ${gamesLogged} -- Bets graded: ${betsGraded} -- Injury-synced: ${injuryTeams} teams -- Stats-synced: ${statsTeams} teams`
+      );
+      refresh(sport);
+      refreshStatuses(sport);
+    } catch (err) {
+      setSyncError(err instanceof Error ? err.message : "ESPN sync failed");
+    } finally {
+      setSyncing(false);
+    }
+  }, [sport, refresh, refreshStatuses]);
 
   useEffect(() => {
     refresh(sport);
@@ -252,17 +282,32 @@ export default function RatingsPanel() {
           <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest flex items-center gap-2">
             <Trophy className="text-[#00FF5B]" size={14} /> Power Rankings
           </h3>
-          <select
-            value={sport}
-            onChange={(e) => setSport(e.target.value)}
-            className="bg-[#06080A] border border-[#1C212B] rounded-lg px-2 py-1 text-xs text-white"
-          >
-            <option value="NFL">NFL</option>
-            <option value="NBA">NBA</option>
-            <option value="MLB">MLB</option>
-            <option value="NCAAF">NCAAF</option>
-          </select>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={runEspnSyncNow}
+              disabled={syncing}
+              title="Runs auto-settlement, injury sync, and stats sync right now instead of waiting for their scheduled polls"
+              className="bg-[#06080A] border border-[#00FF5B] text-[#00FF5B] font-bold text-[10px] uppercase rounded-lg px-3 py-1.5 hover:bg-[#00FF5B]/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {syncing ? "Syncing..." : "Sync ESPN Data Now"}
+            </button>
+            <select
+              value={sport}
+              onChange={(e) => setSport(e.target.value)}
+              className="bg-[#06080A] border border-[#1C212B] rounded-lg px-2 py-1 text-xs text-white"
+            >
+              <option value="NFL">NFL</option>
+              <option value="NBA">NBA</option>
+              <option value="MLB">MLB</option>
+              <option value="NCAAF">NCAAF</option>
+            </select>
+          </div>
         </div>
+        {(syncResult || syncError) && (
+          <div className={`text-[11px] mb-3 ${syncError ? "text-red-400" : "text-[#00FF5B]"}`}>
+            {syncError || syncResult}
+          </div>
+        )}
         {ratings.length === 0 ? (
           <p className="text-slate-600 text-xs italic">
             No {sport} results logged yet -- every team starts neutral at 1500 (wide uncertainty) until you log a game.
