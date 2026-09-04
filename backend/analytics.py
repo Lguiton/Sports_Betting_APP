@@ -865,6 +865,21 @@ STATS_SYNC_INTERVAL_MINUTES = 180  # standings move slowly game-to-game -- no ne
 _STATS_DIFF_SCALE = {"NFL": 3.0, "NBA": 3.0, "MLB": 9.0, "NCAAF": 2.5}
 _STATS_ADJUSTMENT_CAP_PER_SPORT = {"NFL": 60.0, "NBA": 60.0, "MLB": 45.0, "NCAAF": 60.0}
 
+# Small-sample dampener: early in a season, a team's games-played count is
+# tiny (Week 2 of the NFL means every team has played 1-2 games), so its
+# points-differential-per-game is dominated by noise -- one blowout either
+# way, and the scaled adjustment above would swing to nearly its full cap
+# on a single data point. This is the exact same problem Glicko-2's RD
+# already solves for the base rating (a thin history gets less
+# confidence) -- this cycle just didn't inherit that safeguard, so it's
+# added here explicitly: the adjustment is scaled down by
+# games_played / full-confidence-games (capped at 1.0), reaching full
+# strength only once a team has played roughly half a season's worth of
+# games. A team 2 games into the season now gets a small nudge instead of
+# a near-max one; the same real record still reaches full weight later in
+# the season without anyone needing to touch this again.
+_STATS_FULL_CONFIDENCE_GAMES = {"NFL": 8, "NBA": 20, "MLB": 40, "NCAAF": 6}
+
 
 def _num(v):
     """Best-effort float parse of whatever ESPN handed back for a stat
@@ -930,10 +945,13 @@ def run_stats_sync_cycle() -> dict:
                     continue
                 per_game_diff = season_diff / games_played
 
-            adjustment = max(-cap, min(cap, per_game_diff * scale))
+            full_confidence_games = _STATS_FULL_CONFIDENCE_GAMES.get(sport, 10)
+            confidence = min(1.0, games_played / full_confidence_games)
+            adjustment = max(-cap, min(cap, per_game_diff * scale * confidence))
             wins_disp = int(wins) if wins is not None else "?"
             losses_disp = int(losses) if losses is not None else "?"
-            note = f"Auto (ESPN standings): {wins_disp}-{losses_disp}, {per_game_diff:+.1f} diff/g"
+            note = (f"Auto (ESPN standings): {wins_disp}-{losses_disp} "
+                    f"({int(games_played)} GP, {confidence * 100:.0f}% weight), {per_game_diff:+.1f} diff/g")
 
             try:
                 replace_auto_team_status(sport, team, adjustment, note, expires_at=None, source="espn_stats_auto")

@@ -655,3 +655,43 @@ glance instead of both saying "Auto -- ESPN").
   already-shipped code (already backing the live `/espn/standings`
   endpoint before this session), not new/unverified parsing, which is why
   it was used here instead of the flagged-as-unverified `get_team_stats`.
+
+## Follow-up fix: ESPN stats sync adjustments were too aggressive early in a
+## season (small-sample noise, no confidence dampening)
+
+**Reported:** right after the stats sync went live, real NFL Week 2-3
+numbers looked extreme -- e.g. the Colts (0-2) showed a **-55.5**
+situational adjustment, the Ravens (3-0) were capped at **+60**, several
+other teams sat in the +/-30 to +/-44 range, all off of just 2-3 games
+played.
+
+**Root cause:** the adjustment scaled purely off points-differential-per-
+game with no regard for *how many games* that average was actually based
+on. Divide one blowout loss by 2 games played and you get a huge
+per-game number, which the scale factor then pushed straight to (or past,
+before the per-sport cap) its maximum -- on the strength of a single data
+point. This is exactly the small-sample problem Glicko-2's RD already
+solves for the base rating itself (a team with thin history gets pulled
+toward uncertainty instead of an extreme number) -- the new stats-sync
+adjustment just didn't inherit that safeguard.
+
+**Fix:** added a confidence taper, `_STATS_FULL_CONFIDENCE_GAMES` (NFL 8,
+NBA 20, MLB 40, NCAAF 6 -- roughly a half-season anchor per sport). The
+computed adjustment is multiplied by `min(1.0, games_played /
+full_confidence_games)` before the per-sport cap is applied, so a team
+2 games into the season gets a small nudge instead of a near-max one, and
+the same real record reaches full scaled weight naturally once the season
+is far enough along -- no extra step needed, and nothing amplifies past
+1.0x for a team with a long track record. The status note now also shows
+the games-played count and confidence weight (e.g. "0-2 (2 GP, 25%
+weight), -18.5 diff/g") so it's visible at a glance in the Ratings panel
+why a given adjustment is small or large.
+
+**Re-verified with the same real records from the reported screenshot:**
+Colts (0-2, -18.5 diff/g) -55.5 -> **-13.9**; Ravens (3-0, +21.7 diff/g)
+capped +60 -> **+24.4**; Eagles (0-3, -12.3 diff/g) -37 -> **-13.8**; Rams
+(3-0, +14.7 diff/g) +44 -> **+16.5**. Also checked the taper doesn't
+misbehave at the boundary: the same record hypothetically at 8 games
+played reaches full (uncapped-by-confidence) weight, and at 16 games
+(2x the threshold) it correctly stays at 1.0x rather than amplifying
+further.
