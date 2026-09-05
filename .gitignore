@@ -4,3 +4,4 @@ node_modules/
 __pycache__/
 .next/
 data/backups/
+data/telemetry.duckdb
