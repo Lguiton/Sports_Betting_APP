@@ -233,11 +233,28 @@ def get_ratings(sport: str):
 AUTO_SETTLE_INTERVAL_MINUTES = 20
 
 
-def _game_already_logged(conn, sport: str, home_team: str, away_team: str, game_date: str) -> bool:
+def _game_already_logged(conn, sport: str, home_team: str, away_team: str,
+                          home_score: float, away_score: float) -> bool:
+    """Dedup key deliberately does NOT include game_date. Confirmed live:
+    the dual-date (today + yesterday) scoreboard fetch in
+    run_auto_settlement_cycle can return the exact same real game with a
+    different extracted game_date across separate cycle runs -- ESPN's
+    scoreboard `date` field for a given event isn't always stable across
+    different `dates=` query values, and this app's own fallback
+    (`(g.get("date") or today)[:10]`) makes that worse by substituting
+    whatever day the cycle happens to run on when the field is missing.
+    Five real games were double-logged this way in production before this
+    fix -- each one under two different game_dates -- silently doubling
+    the Glicko rating impact of an actual single result. Matching on the
+    final score instead (which is what a duplicate insert of the same
+    real game will always share) is what actually caught them; two
+    genuinely different games between the same two teams landing on the
+    exact same final score is essentially never going to happen within
+    the few-day window this cycle looks at."""
     row = conn.execute(
         "SELECT 1 FROM game_results WHERE sport = ? AND lower(home_team) = lower(?) "
-        "AND lower(away_team) = lower(?) AND game_date = ?",
-        [sport, home_team, away_team, game_date],
+        "AND lower(away_team) = lower(?) AND home_score = ? AND away_score = ?",
+        [sport, home_team, away_team, home_score, away_score],
     ).fetchone()
     return row is not None
 
@@ -328,7 +345,7 @@ def run_auto_settlement_cycle() -> dict:
 
             conn = _connect()
             try:
-                already_logged = _game_already_logged(conn, sport_norm, home_team, away_team, game_date)
+                already_logged = _game_already_logged(conn, sport_norm, home_team, away_team, home_score, away_score)
             finally:
                 conn.close()
 

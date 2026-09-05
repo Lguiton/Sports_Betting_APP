@@ -53,8 +53,21 @@ export default function RatingsPanel() {
     setSyncing(true);
     setSyncError(null);
     setSyncResult(null);
+    // This endpoint can make a lot of sequential ESPN requests under the
+    // hood (auto-settlement across 4 sports x 2 dates, then one injury
+    // check per team currently playing, then a standings pull per sport)
+    // -- on a normal day it finishes in a few seconds, but a big slate of
+    // games (or ESPN being slow to respond) can genuinely take a while.
+    // Without a timeout here, a single slow/hanging request would leave
+    // the button reading "Syncing..." forever with no feedback -- so this
+    // gives up after 90s and reports that clearly instead of looking
+    // frozen (the sync may still finish on the backend even after this
+    // gives up client-side; re-running it, or just waiting for the next
+    // scheduled poll, will reflect the result either way).
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 90_000);
     try {
-      const res = await fetch(`${backendUrl()}/espn-sync/run-all`, { method: "POST" });
+      const res = await fetch(`${backendUrl()}/espn-sync/run-all`, { method: "POST", signal: controller.signal });
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "ESPN sync failed");
@@ -70,8 +83,13 @@ export default function RatingsPanel() {
       refresh(sport);
       refreshStatuses(sport);
     } catch (err) {
-      setSyncError(err instanceof Error ? err.message : "ESPN sync failed");
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setSyncError("Taking longer than 90s -- it may still be finishing in the background (a big slate of games can mean a lot of ESPN calls). Give it a bit, then refresh.");
+      } else {
+        setSyncError(err instanceof Error ? err.message : "ESPN sync failed");
+      }
     } finally {
+      clearTimeout(timeoutId);
       setSyncing(false);
     }
   }, [sport, refresh, refreshStatuses]);

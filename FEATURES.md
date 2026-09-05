@@ -749,3 +749,88 @@ an isolated, unrelated `os.remove()` test) rather than to this code, but
 they mean the very last few end-to-end runs are not as clean a signal as
 the earlier ones. The button should be tested live once on the real
 dashboard before being trusted for anything time-sensitive.
+Cj 
+## Fix: NCAAF ratings inflated by real games getting double-logged
+
+**What was reported:** a screenshot of the NCAAF Power Rankings showing
+teams like UCF Knights at 1720.3 after only 1-2 logged games -- a jump
+that size normally takes many games of Glicko-2 movement, not one or two,
+so it warranted checking against the real data rather than assuming it
+was just normal variance.
+
+**What was actually found:** UCF Knights' single result had been applied
+to their rating *twice* (1500 -> 1662.3 -> 1720.3, an exact
+double-application of the same game). `game_results` had 5 real games
+each logged as two separate rows -- same sport, same two teams, same
+final score, but two different `game_date` values. The root cause traces
+back to this same session's earlier auto-settlement hardening: checking
+both today's *and* yesterday's ESPN scoreboard (so a game that finished
+late isn't silently missed) is correct, but ESPN's scoreboard `date`
+field for the same real game isn't always stable across the two
+different `dates=` query parameters used to fetch it -- and the
+duplicate-prevention check (`_game_already_logged`) matched on
+`game_date`, so a game that came back tagged with two different dates
+looked "new" the second time and got logged again, each logging feeding
+the rating update math a second time.
+
+**Fix:** changed `_game_already_logged`'s dedup key from `game_date` to
+the game's final score (`home_score`/`away_score`) instead, since the
+score is what's actually stable for a given real matchup, while the date
+ESPN happens to tag it with is not. Two genuinely different games
+between the same two teams landing on the exact same final score within
+the few-day window this cycle looks at is essentially never going to
+happen, so this is a safe key.
+
+**Data repair (the existing bad data needed fixing, not just the code):**
+backed up the live database first
+(`data/backups/telemetry_pre_dedup_repair_20260904_235125.duckdb`), then
+wrote `repair_ratings.py`, which finds duplicate `game_results` rows
+(same sport/teams/score), deletes the later-dated duplicate of each pair,
+wipes `team_ratings`, and rebuilds every team's rating from scratch by
+replaying the deduplicated game history in chronological order through
+the real Glicko-2 update math -- the same math `sports_agent/ratings.py`
+uses live, not a re-implementation of it. Tested against a scratch copy
+of the database first, reviewed the output, then ran it identically
+against the real live database.
+
+**Verified before/after for the affected teams (NCAAF):**
+UCF Knights 1720.3 -> **1662.3**; Delaware Blue Hens, Kennesaw State Owls,
+USC Trojans, Wake Forest Demon Deacons, Rutgers Scarlet Knights, and
+Massachusetts Minutemen all similarly corrected back down to the rating
+their single real logged game actually earns them. 5 duplicate rows were
+removed from `game_results`, `team_ratings` was fully rebuilt from the
+deduplicated history, and re-running the duplicate-group query afterward
+confirmed zero duplicate groups remain. The corrected ratings are still
+high relative to the 1500 default because a single lopsided win still
+moves Glicko-2 substantially with so little established history for a
+team (that part is expected, correct behavior) -- what was wrong was the
+same result being counted twice, which is now fixed both in the code
+going forward and in the existing data.
+
+## Fix: "Sync ESPN Data Now" button appearing stuck on "Syncing..."
+
+**What was reported:** the button could sit on "Syncing..." with no
+feedback, which reads as hung even when it's actually still working.
+
+**What was found:** `/espn-sync/run-all` runs all three ESPN cycles
+back to back in one request, and injury sync in particular makes one
+ESPN call per team playing that day -- on a busy slate this can
+genuinely take a while. Neither the endpoint nor the frontend's fetch
+call had any timeout, so a slow-but-working sync and a truly hung
+request looked identical to the user: both just sat there indefinitely.
+
+**Fix:** added a 90-second client-side timeout (`AbortController`) to
+the button's fetch in `RatingsPanel.tsx`. If the sync hasn't finished
+within 90 seconds, the button now clearly reports "Taking longer than
+90s -- it may still be finishing in the background (a big slate of games
+can mean a lot of ESPN calls). Give it a bit, then refresh." instead of
+spinning forever with no information. The sync itself isn't cancelled by
+this (the backend keeps running it), so refreshing shortly after still
+picks up its results.
+
+**Verification:** a clean project-wide `tsc --noEmit` pass with the
+change applied, and a clean Python import of `backend.main` /
+`backend.analytics` with the dedup-key fix above applied alongside it.
+This round's fixes have not yet been exercised live end-to-end on the
+real dashboard against a live ESPN sync -- worth a quick live check next
+time a sync is run, particularly on a day with a large slate of games.
